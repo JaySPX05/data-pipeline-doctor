@@ -1,4 +1,4 @@
-"""Incident persistence (SQLite) and metrics. Owner: P4."""
+"""Incident persistence (SQLite) and metrics. Owner: P1 (Jay)."""
 import uuid
 from collections import defaultdict
 

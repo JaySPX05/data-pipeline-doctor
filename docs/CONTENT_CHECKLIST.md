@@ -11,10 +11,10 @@ Pick your own angle so the 7 articles don't overlap:
 
 | Person | Suggested angle |
 | --- | --- |
-| P1 Jay | Building an agent loop that trusts memory over the stack trace |
+| P1 Jay | Building an agent loop that trusts memory over the stack trace (or: fingerprinting logs so two different traces mean the same failure) |
 | P2 | Designing what an on-call agent should remember (retain/recall/reflect) |
 | P3 | Generating 30 days of realistic pipeline failures |
-| P4 | Log fingerprinting: making two different logs mean the same failure |
+| P4 | Measuring whether agent memory actually helps: our eval, memory ON vs OFF |
 | P5 | Designing a diagnosis card engineers trust at 3 AM |
 | P6 | Showing an agent's learning curve |
 | P7 | Wiring an AI agent into Airflow's on_failure_callback |
