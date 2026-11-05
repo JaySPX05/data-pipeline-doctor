@@ -4,7 +4,9 @@ Groq failure modes this handles:
 - 400 `tool_use_failed`: the model produced a malformed tool call. Groq returns what the model
   wrote in `failed_generation`; if that already contains our final JSON we salvage it,
   otherwise we retry on the fallback model, then once more without tools.
-- 429 rate limit: one short back-off, then the fallback model.
+- 429 rate limit: wait for Groq's Retry-After (up to max_rate_limit_wait_s) once, then the fallback
+  model. Daily quota (TPD/RPD) errors skip the wait. Free tier: gpt-oss-120b = 30 RPM, 8K TPM, 200K TPD.
+- 404 model_not_found: the model id is retired or not on this account; go to the next model.
 - 401/403: bad key. Fail fast (retrying other models cannot help).
 - Prose instead of JSON, ```json fences, <think> blocks: extract_json() copes.
 """
@@ -27,7 +29,7 @@ log = logging.getLogger(__name__)
 class ChatResult:
     message: Any                      # object with .content and .tool_calls
     model: str
-    attempts: list[str] = field(default_factory=list)  # e.g. ["gpt-oss-120b:tool_use_failed", "qwen3-32b:ok"]
+    attempts: list[str] = field(default_factory=list)  # e.g. ["gpt-oss-120b:tool_use_failed", "gpt-oss-20b:ok"]
     salvaged: bool = False            # final answer recovered from a failed tool call
 
 
@@ -41,6 +43,28 @@ def _error_code(exc: Exception) -> str:
         return str(code)
     status = getattr(exc, "status_code", None)
     return f"http_{status}" if status else type(exc).__name__
+
+
+def retry_after_seconds(exc: Exception) -> float | None:
+    """Seconds Groq asks us to wait on a 429, or None if the daily quota (TPD/RPD) is gone."""
+    text = f"{exc} {getattr(exc, 'body', '')}".lower()
+    if "per day" in text or "(tpd)" in text or "(rpd)" in text:
+        return None  # waiting a few seconds won't help; go to the fallback model
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    value = headers.get("retry-after") if hasattr(headers, "get") else None
+    try:
+        return float(value) if value is not None else 2.0
+    except ValueError:
+        return 2.0
+
+
+def model_params(cfg: Settings, model: str) -> dict:
+    """Per-model request params. gpt-oss models accept reasoning_effort; others don't."""
+    params: dict[str, Any] = {"max_completion_tokens": cfg.llm_max_tokens}
+    if model.startswith("openai/gpt-oss") and cfg.llm_reasoning_effort:
+        params["reasoning_effort"] = cfg.llm_reasoning_effort
+    return params
 
 
 def salvage_failed_generation(exc: Exception) -> str | None:
@@ -82,7 +106,12 @@ class LLMClient:
         for model, attempt_tools in plan:
             for retry in range(2):  # second pass only after a rate limit
                 try:
-                    kwargs: dict[str, Any] = {"model": model, "messages": messages, "temperature": temperature}
+                    kwargs: dict[str, Any] = {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        **model_params(self.cfg, model),
+                    }
                     if attempt_tools:
                         kwargs.update(tools=attempt_tools, tool_choice="auto")
                     elif json_mode:
@@ -105,8 +134,15 @@ class LLMClient:
                             salvaged=True,
                         )
                     if code in ("http_429", "rate_limit_exceeded") and retry == 0:
-                        time.sleep(2)
-                        continue
+                        wait = retry_after_seconds(exc)
+                        if wait is not None and wait <= self.cfg.max_rate_limit_wait_s:
+                            log.info("Rate limited on %s, waiting %.1fs (Retry-After)", model, wait)
+                            time.sleep(wait)
+                            continue
+                        break  # daily quota gone or wait too long: try the next model
+                    if code == "model_not_found":
+                        log.error("Model %s is not available on this Groq account. Check LLM_MODEL / LLM_FALLBACK_MODEL in .env", model)
+                        break
                     if json_mode and code in ("json_validate_failed", "http_400") and retry == 0:
                         json_mode = False  # some models reject JSON mode; retry as plain text
                         continue

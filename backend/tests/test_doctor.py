@@ -6,6 +6,7 @@ import pytest
 from app.agent.doctor import FailureDoctor
 from app.agent.guardrails import apply_guardrails
 from app.agent.llm import LLMError
+from app.config import settings
 from app.db.database import SessionLocal, init_db
 from app.models.schemas import Diagnosis, Incident, Verdict
 from tests.fakes import FakeStore, ScriptedLLM, diagnosis_json, memory, reply, tool_call
@@ -79,10 +80,11 @@ def test_prose_reply_is_repaired_with_json_mode(incident, session):
 
 
 def test_tool_loop_is_capped_and_forced_to_answer(incident, session):
-    looping = [reply(tool_calls=[tool_call("grep_log", {"pattern": f"x{i}"}, f"c{i}")]) for i in range(4)]
+    steps = settings.max_tool_steps
+    looping = [reply(tool_calls=[tool_call("grep_log", {"pattern": f"x{i}"}, f"c{i}")]) for i in range(steps)]
     llm = ScriptedLLM(*looping, reply(diagnosis_json()))
     dx, trace = FailureDoctor(store=FakeStore([RESOLUTION]), llm=llm).diagnose_with_trace(incident, session)
-    assert len(trace.tool_calls) == 4
+    assert len(trace.tool_calls) == steps
     assert llm.requests[-1]["tools"] is None  # final call had no tools
     assert dx.verdict == Verdict.KNOWN_ISSUE
 
@@ -107,7 +109,9 @@ def test_memory_off_skips_recall(incident, session):
     dx = FailureDoctor(store=store, llm=llm).diagnose(incident, session, use_memory=False)
     assert store.recall_calls == 0
     assert dx.memory_used is False
-    assert "search_memory" not in str(llm.requests[0]["tools"])
+    tools = str(llm.requests[0]["tools"])
+    assert "search_memory" not in tools and "get_retry_history" not in tools
+    assert "TASK HISTORY" not in llm.requests[0]["messages"][1]["content"]
 
 
 def test_odd_model_output_is_normalised(incident, session):
@@ -115,6 +119,47 @@ def test_odd_model_output_is_normalised(incident, session):
     dx = FailureDoctor(store=FakeStore([RESOLUTION]), llm=llm).diagnose(incident, session)
     assert dx.verdict == Verdict.KNOWN_ISSUE
     assert dx.suggested_fix == "1. step a\n2. step b"
+
+
+# ---------------------------------------------------------------- prefetch
+CHANGES = [
+    {"id": "c1", "at": "2026-10-18T22:10:00+00:00", "type": "vendor_release", "affects_dags": ["orders_etl"],
+     "text": "Vendor FreshFarm released order feed v2.5: column customer_id renamed to cust_id."},
+    {"id": "c2", "at": "2026-10-19T01:00:00+00:00", "type": "deploy", "affects_dags": ["payments_daily"],
+     "text": "Deployed payments aggregator v3."},
+    {"id": "c3", "at": "2026-10-10T00:00:00+00:00", "type": "vendor_release", "affects_dags": ["orders_etl"],
+     "text": "Too old: outside the 72h window."},
+    {"id": "c4", "at": "2026-10-19T02:00:00+00:00", "type": "iam_rotation", "affects_dags": ["inventory_sync"],
+     "text": "Rotated IAM key for svc-inventory-export."},
+]
+
+
+@pytest.fixture
+def change_feed(monkeypatch):
+    monkeypatch.setattr("app.agent.tools._load_change_feed", lambda: [dict(c) for c in CHANGES])
+
+
+def test_changes_are_prefetched_by_dag(incident, change_feed):
+    from app.agent.tools import changes_for_incident
+
+    ids = [c["id"] for c in changes_for_incident(incident)]
+    assert ids == ["c1"]  # same DAG, inside the window; other DAGs and old changes excluded
+    assert [c["id"] for c in changes_for_incident(incident, keyword="aws svc-inventory")] == ["c4", "c1"]
+
+
+def test_prefetched_change_is_in_prompt_and_supports_upstream_verdict(incident, session, change_feed):
+    llm = ScriptedLLM(reply(diagnosis_json(verdict="UPSTREAM_CHANGE", confidence=0.85)))
+    dx, trace = FailureDoctor(store=FakeStore([]), llm=llm).diagnose_with_trace(incident, session, use_memory=False)
+    prompt = llm.requests[0]["messages"][1]["content"]
+    assert "customer_id renamed to cust_id" in prompt and "5.0h before" in prompt
+    assert trace.prefetched_changes == 1 and len(trace.llm_calls) == 1
+    assert dx.verdict == Verdict.UPSTREAM_CHANGE and dx.confidence == 0.85  # not capped: change was seen
+
+
+def test_memory_on_includes_task_history(incident, session):
+    llm = ScriptedLLM(reply(diagnosis_json()))
+    FailureDoctor(store=FakeStore([RESOLUTION]), llm=llm).diagnose(incident, session)
+    assert "TASK HISTORY" in llm.requests[0]["messages"][1]["content"]
 
 
 # ---------------------------------------------------------------- guardrails
