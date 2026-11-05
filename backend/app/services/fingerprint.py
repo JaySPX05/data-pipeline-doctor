@@ -1,7 +1,7 @@
 """Turn a noisy task log into a stable failure fingerprint.
 
 Two failures with the same root cause should get the same fingerprint even though
-their timestamps, hostnames, row counts and run ids differ.  Owner: P4.
+their timestamps, hostnames, row counts and run ids differ.  Owner: P1 (Jay).
 """
 import hashlib
 import re

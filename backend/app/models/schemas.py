@@ -43,6 +43,11 @@ class Evidence(BaseModel):
     occurred_at: datetime | None = None
     document_id: str | None = None  # incident id the memory came from
     type: str | None = None          # Hindsight fact type: world / experience / observation
+    tags: list[str] = Field(default_factory=list)  # e.g. ["fp:fp_13e8231d", "kind:correction"] (additive, Day 1)
+
+    def kind(self) -> str | None:
+        """failure / resolution / correction / change, from the kind: tag."""
+        return next((t.split(":", 1)[1] for t in self.tags if t.startswith("kind:")), None)
 
 
 class Diagnosis(BaseModel):

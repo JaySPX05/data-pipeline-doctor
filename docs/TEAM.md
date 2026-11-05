@@ -1,16 +1,17 @@
 # Team split and working rules
 
-Replace P2-P7 with names. Each person owns a folder, so we can work in parallel without merge conflicts.
+Jay covers two roles (agent core + backend), so P4 owns testing and evaluation and hands him a bug list each day. Replace P2-P7 with names. Each person owns a folder, so we can work in parallel without merge conflicts.
+Ready-to-paste prompts for your coding agent, per role and per day: [AI_PROMPTS.md](AI_PROMPTS.md).
 
 | Person | Role | Owns | Day 1 | Day 2 | Day 3 |
 | --- | --- | --- | --- | --- | --- |
-| P1 Jay | Tech lead + agent core | `backend/app/agent/`, `backend/app/prompts/` | Freeze schemas; agent loop with Groq + tool calling | Tools on real data; verdict logic; memory ON/OFF | Prompt tuning on all scenarios; demo dry runs; final merge |
+| P1 Jay | Tech lead, agent core + backend/API | `backend/app/agent/`, `prompts/`, `api/`, `services/`, `db/` | Freeze schemas; agent loop with Groq + tool calling; check endpoints on real logs | Tools on real data; verdict logic; memory ON/OFF; finish API (filters, metrics summary) | Prompt tuning from P4's eval; fix P4's bug list; demo dry runs; final merge |
 | P2 | Memory engineer | `backend/app/memory/` | Hindsight running; bank + mission; retain/recall working | Recall query design; corrections; reflect → Health Brief | Recall quality; fallback when Hindsight is down; README memory section |
 | P3 | Data + simulation | `data/`, `scripts/` | Remaining 6 scenario YAMLs (see data/README.md) | 30-day history + change feed; seed + replay tuned | Data realism; reset script tested |
-| P4 | Backend / API | `backend/app/api/`, `services/`, `db/` | Fingerprinting edge cases; endpoints solid | Metrics, filters, tests | Huge logs, bad payloads; API docs |
+| P4 | QA + eval engineer | `backend/tests/`, `backend/app/agent/eval.py`, `tests/e2e/` | Fingerprint + API test suite; bug list for Jay | Agent eval harness (memory ON vs OFF); e2e smoke test | Edge-case tests; final accuracy numbers for README |
 | P5 | Frontend core | `frontend/src/pages/Inbox.jsx`, `Incident.jsx`, `components/` | Inbox + incident page on mocks | Wire to live API; feedback flow | Polish, loading/error states |
-| P6 | Frontend memory views | `frontend/src/pages/Insights.jsx`, `Memory.jsx` | Learning curve + brief on mocks | ON/OFF comparison; memory explorer | Demo visuals; screenshots for articles |
-| P7 | DevOps, QA, demo + content | `docker-compose.yml`, `.github/`, `docs/`, `integrations/` | Compose stack boots for everyone; CI green | End-to-end test run; Airflow callback (optional) | Demo video; content checklist; submission |
+| P6 | Frontend memory views | `frontend/src/pages/Insights.jsx`, `Memory.jsx`, `components/MemoryCompare.jsx` | Learning curve + brief on mocks | ON/OFF comparison; memory explorer | Demo visuals; screenshots for articles |
+| P7 | DevOps, demo + content | `docker-compose.yml`, `Makefile`, `README.md`, `.github/`, `docs/`, `integrations/` | Compose stack boots for everyone; CI green | Full demo rehearsal from a fresh clone; Airflow callback (optional) | Demo video; content checklist; submission |
 
 ## Gates
 

@@ -68,12 +68,12 @@ backend/app/
   main.py              FastAPI app + /api/health
   config.py            settings from .env
   models/schemas.py    shared contracts (FROZEN after Day 1 midday)
-  api/                 failures, incidents, memory, metrics routes        (P4)
-  services/            fingerprinting + incident store                    (P4)
+  api/                 failures, incidents, memory, metrics routes        (P1)
+  services/            fingerprinting + incident store                    (P1)
   agent/               doctor.py loop, llm.py (Groq), tools.py            (P1)
   memory/              hindsight_store.py: retain / recall / reflect      (P2)
   prompts/             system prompt                                       (P1)
-backend/tests/         pytest, runs fully offline
+backend/tests/         pytest, runs fully offline                         (P4)
 data/scenarios/        failure scenario YAMLs                              (P3)
 scripts/               generate_history, seed_memory, replay, reset_demo   (P3)
 frontend/src/          React + Vite + Tailwind: Inbox, Incident, Insights, Memory (P5, P6)
