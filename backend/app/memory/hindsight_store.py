@@ -94,12 +94,13 @@ class MemoryStore:
 
     # ------------------------------------------------------------------ retain
     def retain_failure(self, incident: Incident) -> None:
-        verdict = incident.diagnosis.verdict.value if incident.diagnosis else "UNDIAGNOSED"
+        # The agent's own verdict is deliberately NOT stored here: an unconfirmed guess in memory
+        # would reinforce itself. Confirmed verdicts arrive via retain_feedback().
         changes = f" Recent changes: {'; '.join(incident.recent_changes)}." if incident.recent_changes else ""
         content = (
             f"Task {incident.dag_id}.{incident.task_id} failed at {incident.occurred_at:%Y-%m-%d %H:%M} "
             f"(try {incident.try_number}) with {incident.error_class}: {incident.error_message[:300]}. "
-            f"Fingerprint {incident.fingerprint}. Agent verdict: {verdict}.{changes}"
+            f"Fingerprint {incident.fingerprint}.{changes}"
         )
         self._call(
             "retain",
@@ -170,6 +171,7 @@ class MemoryStore:
                     occurred_at=occurred_dt,
                     document_id=getattr(r, "document_id", None),
                     type=getattr(r, "type", None),
+                    tags=list(getattr(r, "tags", None) or []),
                 )
             )
         return out
