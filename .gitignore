@@ -1,0 +1,22 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# data
+data/generated/
+data/*.sqlite3
+
+# node
+node_modules/
+frontend/dist/
+
+# os / editors
+.DS_Store
+.idea/
+.vscode/

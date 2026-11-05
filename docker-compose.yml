@@ -1,0 +1,47 @@
+# One-command local stack: Hindsight + backend + frontend.  Owner: P7.
+#   docker compose up --build
+# Using Hindsight Cloud instead? Set HINDSIGHT_URL/HINDSIGHT_API_KEY in .env and run:
+#   docker compose up --build backend frontend
+
+services:
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:latest   # large first pull; start it early on Day 1
+    ports:
+      - "8888:8888"   # API
+      - "9999:9999"   # Hindsight web UI: inspect the memory bank during the demo
+    environment:
+      HINDSIGHT_API_LLM_PROVIDER: groq
+      HINDSIGHT_API_LLM_API_KEY: ${GROQ_API_KEY}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_LLM_MODEL:-openai/gpt-oss-20b}
+      # Uncomment if the Groq free tier gives service_tier errors:
+      # HINDSIGHT_API_LLM_GROQ_SERVICE_TIER: on_demand
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      HINDSIGHT_URL: ${HINDSIGHT_URL_DOCKER:-http://hindsight:8888}
+    volumes:
+      - ./data:/app/data
+      - ./backend/app:/app/backend/app   # hot reload
+    depends_on:
+      - hindsight
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_PROXY: http://backend:8000
+      VITE_USE_MOCKS: ${VITE_USE_MOCKS:-false}
+    volumes:
+      - ./frontend/src:/app/src
+    depends_on:
+      - backend
+
+volumes:
+  hindsight-data:
