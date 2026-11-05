@@ -15,8 +15,12 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_base_url: str = "https://api.groq.com/openai/v1"
     llm_model: str = "openai/gpt-oss-120b"
-    llm_fallback_model: str = "qwen/qwen3-32b"
-    max_tool_steps: int = 4
+    llm_fallback_model: str = "openai/gpt-oss-20b"  # production model, separate rate-limit bucket
+    max_tool_steps: int = 2          # changes + task history are prefetched, so tools are rarely needed
+    llm_reasoning_effort: str = "low"  # gpt-oss only: fewer reasoning tokens = faster + cheaper
+    llm_max_tokens: int = 2048       # completion cap (includes reasoning tokens)
+    log_tail_lines: int = 40         # log lines sent to the model
+    max_rate_limit_wait_s: float = 20.0  # longest we wait on a 429 Retry-After before falling back
 
     # Hindsight memory
     hindsight_url: str = "http://localhost:8888"

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.agent.guardrails import apply_guardrails, corrections_for, matches_fingerprint
 from app.agent.llm import LLMClient, LLMError, extract_json
-from app.agent.tools import ToolContext, run_tool, tool_schemas
+from app.agent.tools import ToolContext, changes_for_incident, get_retry_history, run_tool, tool_schemas
 from app.config import Settings, settings as default_settings
 from app.memory.hindsight_store import MemoryStore
 from app.models.schemas import Diagnosis, Evidence, Incident, Verdict
@@ -30,6 +30,8 @@ class AgentTrace:
     use_memory: bool
     recalled: int = 0
     recall_ms: int = 0
+    prefetched_changes: int = 0
+    prefetched_history: int = 0
     llm_calls: list[dict] = field(default_factory=list)
     tool_calls: list[dict] = field(default_factory=list)
     repaired: bool = False
@@ -44,7 +46,8 @@ class AgentTrace:
         models = ",".join(sorted({c["model"] for c in self.llm_calls})) or "none"
         tools = ",".join(t["name"] for t in self.tool_calls) or "none"
         return (
-            f"memory={'on' if self.use_memory else 'off'} recalled={self.recalled} models={models} "
+            f"memory={'on' if self.use_memory else 'off'} recalled={self.recalled} "
+            f"changes={self.prefetched_changes} history={self.prefetched_history} models={models} "
             f"llm_calls={len(self.llm_calls)} tools=[{tools}] repaired={self.repaired} "
             f"fallback={self.fallback} guardrails={len(self.guardrails)} {self.total_ms}ms"
         )
@@ -64,16 +67,48 @@ def _format_memories(incident: Incident, evidence: list[Evidence]) -> str:
     return "\n".join(lines)
 
 
-def _incident_prompt(incident: Incident, evidence: list[Evidence]) -> str:
-    changes = "\n".join(f"- {c}" for c in incident.recent_changes) or "- none reported"
+def _format_changes(changes: list[dict]) -> str:
+    if not changes:
+        return "CHANGE FEED (72h before the failure, this DAG): no changes recorded."
+    lines = ["CHANGE FEED (72h before the failure, affecting this DAG, newest first):"]
+    for c in changes:
+        lines.append(f"- [{c.get('type', 'change')}] {c['hours_before_failure']}h before: {c['text']}")
+    return "\n".join(lines)
+
+
+def _format_history(history: dict | None) -> str:
+    if history is None:
+        return ""
+    if not history["previous_failures"]:
+        return "TASK HISTORY: no previous failures of this task in the incident store.\n\n"
+    lines = [
+        f"TASK HISTORY: {history['previous_failures']} previous failures of this task, "
+        f"{history['same_fingerprint']} with this exact fingerprint. Most recent:"
+    ]
+    for h in history["recent"][:5]:
+        resolved = f" -> confirmed cause: {h['resolution']}" if h.get("resolution") else ""
+        lines.append(f"- {h['occurred_at'][:16]} {h['error_class']} {h['fingerprint']} verdict={h['verdict']}{resolved}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _incident_prompt(
+    incident: Incident,
+    evidence: list[Evidence],
+    changes: list[dict] | None = None,
+    history: dict | None = None,
+    log_lines: int = 40,
+) -> str:
+    reported = "\n".join(f"- {c}" for c in incident.recent_changes) or "- none reported"
     return (
         f"FAILED TASK: {incident.dag_id}.{incident.task_id} (run {incident.run_id}, try {incident.try_number})\n"
         f"WHEN: {incident.occurred_at.isoformat()}\n"
         f"ERROR: {incident.error_class}: {incident.error_message}\n"
         f"FINGERPRINT: {incident.fingerprint}\n"
-        f"RECENT CHANGES REPORTED BY SCHEDULER:\n{changes}\n\n"
+        f"CHANGES REPORTED BY SCHEDULER:\n{reported}\n"
+        f"{_format_changes(changes or [])}\n\n"
+        f"{_format_history(history)}"
         f"{_format_memories(incident, evidence)}\n\n"
-        f"LOG TAIL (last 60 lines):\n{chr(10).join(incident.log_tail.splitlines()[-60:])}"
+        f"LOG TAIL (last {log_lines} lines):\n{chr(10).join(incident.log_tail.splitlines()[-log_lines:])}"
     )
 
 
@@ -112,11 +147,19 @@ class FailureDoctor:
             trace.recall_ms = int((time.perf_counter() - t0) * 1000)
             trace.recalled = len(evidence)
 
-        change_seen = False
+        # Prefetch cheap, deterministic context so most diagnoses need a single LLM call.
+        ctx = ToolContext(incident=incident, session=session, store=self.store, use_memory=use_memory)
+        changes = changes_for_incident(incident)
+        history = get_retry_history(ctx) if use_memory else None
+        trace.prefetched_changes = len(changes)
+        trace.prefetched_history = history["previous_failures"] if history else 0
+
+        change_seen = bool(changes)
         diagnosis: Diagnosis | None = None
         if self.llm.available:
             try:
-                diagnosis, change_seen = self._llm_diagnose(incident, session, evidence, use_memory, trace)
+                diagnosis, tool_change_seen = self._llm_diagnose(ctx, evidence, changes, history, trace)
+                change_seen = change_seen or tool_change_seen
             except Exception as exc:
                 trace.fallback = f"heuristic ({type(exc).__name__}: {str(exc)[:160]})"
                 log.error("LLM diagnosis failed for %s, using heuristic: %s", incident.id, exc)
@@ -145,13 +188,19 @@ class FailureDoctor:
         return result
 
     def _llm_diagnose(
-        self, incident: Incident, session: Session, evidence: list[Evidence], use_memory: bool, trace: AgentTrace
+        self,
+        ctx: ToolContext,
+        evidence: list[Evidence],
+        changes: list[dict],
+        history: dict | None,
+        trace: AgentTrace,
     ) -> tuple[Diagnosis, bool]:
-        ctx = ToolContext(incident=incident, session=session, store=self.store, use_memory=use_memory)
-        tools = tool_schemas(use_memory)
+        incident = ctx.incident
+        tools = tool_schemas(ctx.use_memory)
+        prompt = _incident_prompt(incident, evidence, changes, history, self.cfg.log_tail_lines)
         messages: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _incident_prompt(incident, evidence)},
+            {"role": "user", "content": prompt},
         ]
         tool_cache: dict[tuple[str, str], str] = {}
         change_seen = False

@@ -18,7 +18,7 @@ Diagnosis agent ── recall ──► Hindsight memory ◄── retain (failu
         │   ▲                                         ▲
         │   └── tools: change feed, retry history, log grep, memory search
         ▼                                             │
-Groq LLM (gpt-oss-120b, qwen3-32b fallback)           │
+Groq LLM (gpt-oss-120b, gpt-oss-20b fallback)         │
         │                                             │
         ▼                                             │
 React dashboard: diagnosis card + evidence ── engineer feedback
@@ -60,6 +60,14 @@ make replay    # replay days 15-30 live; watch the inbox and the Insights page
 ```
 
 No API keys yet? The backend runs offline: the agent falls back to a rule-based diagnosis and memory calls are skipped (`MEMORY_ENABLED=false`). Frontend devs can use `VITE_USE_MOCKS=true npm run dev`.
+
+## Groq free tier
+
+`openai/gpt-oss-120b` on the free plan allows 30 requests/min, 8K tokens/min and 200K tokens/day, per organization (not per key). The agent is tuned for this: changes and task history are prefetched so most diagnoses are a single ~2K-token call, gpt-oss runs with `reasoning_effort=low`, and on a 429 it waits for Groq's `Retry-After` (up to 20 s) before falling back to `openai/gpt-oss-20b`.
+
+- Each teammate should use a key from their **own** Groq account while developing; keys from one org share one quota.
+- For the demo, consider the pay-as-you-go Developer plan (much higher limits, cents of usage).
+- `model_not_found`? A model id was retired: check `LLM_MODEL` / `LLM_FALLBACK_MODEL` in your `.env` against https://console.groq.com/docs/models.
 
 ## Repo layout
 

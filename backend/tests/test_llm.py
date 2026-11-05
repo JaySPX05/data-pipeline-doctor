@@ -3,14 +3,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.agent.llm import LLMClient, LLMError, extract_json, salvage_failed_generation
+from app.agent.llm import LLMClient, LLMError, extract_json, model_params, retry_after_seconds, salvage_failed_generation
 from app.config import Settings
 
 
 class GroqError(Exception):
-    def __init__(self, code, status=400, body=None):
-        super().__init__(code)
+    def __init__(self, code, status=400, body=None, headers=None, message=None):
+        super().__init__(message or code)
         self.code, self.status_code, self.body = code, status, body or {"code": code}
+        self.response = SimpleNamespace(headers=headers or {})
 
 
 class FakeOpenAI:
@@ -29,7 +30,7 @@ class FakeOpenAI:
         return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
 
 
-CFG = Settings(llm_model="primary", llm_fallback_model="fallback", groq_api_key="")
+CFG = Settings(llm_model="primary", llm_fallback_model="fallback", groq_api_key="", max_rate_limit_wait_s=20)
 TOOLS = [{"type": "function", "function": {"name": "t", "parameters": {"type": "object", "properties": {}}}}]
 
 
@@ -94,3 +95,32 @@ def test_everything_fails_raises():
     fake = FakeOpenAI(GroqError("x", status=500), GroqError("x", status=500))
     with pytest.raises(LLMError):
         LLMClient(CFG, client=fake).chat([])
+
+
+def test_retry_after_header_is_honoured(monkeypatch):
+    waits = []
+    monkeypatch.setattr("app.agent.llm.time.sleep", waits.append)
+    fake = FakeOpenAI(GroqError("rate_limit_exceeded", status=429, headers={"retry-after": "7.5"}), '{"verdict": "NEW"}')
+    LLMClient(CFG, client=fake).chat([])
+    assert waits == [7.5]
+
+
+def test_long_wait_or_daily_quota_goes_to_fallback(monkeypatch):
+    monkeypatch.setattr("app.agent.llm.time.sleep", lambda s: pytest.fail("should not wait"))
+    too_long = GroqError("rate_limit_exceeded", status=429, headers={"retry-after": "45"})
+    daily = GroqError("rate_limit_exceeded", status=429, message="Limit 200000, Used 199990 tokens per day (TPD)")
+    for exc in (too_long, daily):
+        fake = FakeOpenAI(exc, '{"verdict": "NEW"}')
+        assert LLMClient(CFG, client=fake).chat([]).model == "fallback"
+    assert retry_after_seconds(daily) is None
+
+
+def test_model_not_found_goes_to_fallback():
+    fake = FakeOpenAI(GroqError("model_not_found", status=404), '{"verdict": "NEW"}')
+    assert LLMClient(CFG, client=fake).chat([]).model == "fallback"
+
+
+def test_gpt_oss_gets_reasoning_effort_others_do_not():
+    cfg = Settings(llm_reasoning_effort="low", llm_max_tokens=1000)
+    assert model_params(cfg, "openai/gpt-oss-120b") == {"max_completion_tokens": 1000, "reasoning_effort": "low"}
+    assert model_params(cfg, "llama-3.1-8b-instant") == {"max_completion_tokens": 1000}

@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -33,18 +33,35 @@ def _load_change_feed() -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def get_change_feed(ctx: ToolContext, hours_back: int = 72, keyword: str | None = None) -> dict:
-    """Schema changes, deploys and vendor releases in the window before the failure."""
-    end = ctx.incident.occurred_at
+def _naive_utc(dt: datetime) -> datetime:
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+
+
+def changes_for_incident(incident: Incident, hours_back: int = 72, keyword: str | None = None, limit: int = 10) -> list[dict]:
+    """Changes in the window before the failure that affect this DAG (or match any keyword word).
+
+    Matching on the DAG is what makes this reliable: the model's keyword guesses often miss
+    (e.g. it searches 'aws_inventory' but the event says 'svc-inventory-export').
+    """
+    end = _naive_utc(incident.occurred_at)
     start = end - timedelta(hours=hours_back)
+    words = [w for w in re.split(r"[^a-z0-9]+", (keyword or "").lower()) if len(w) > 2]
     items = []
     for change in _load_change_feed():
-        at = datetime.fromisoformat(change["at"])
-        if start <= at.replace(tzinfo=end.tzinfo) <= end:
-            if keyword and keyword.lower() not in change["text"].lower():
-                continue
-            items.append(change)
-    return {"window_hours": hours_back, "changes": items[:20]}
+        at = _naive_utc(datetime.fromisoformat(change["at"]))
+        if not (start <= at <= end):
+            continue
+        affects = change.get("affects_dags") or []
+        text = change["text"].lower()
+        if incident.dag_id in affects or not affects or any(w in text for w in words):
+            items.append({**change, "hours_before_failure": round((end - at).total_seconds() / 3600, 1)})
+    items.sort(key=lambda c: c["hours_before_failure"])
+    return items[:limit]
+
+
+def get_change_feed(ctx: ToolContext, hours_back: int = 72, keyword: str | None = None) -> dict:
+    """Schema changes, deploys and vendor releases in the window before the failure."""
+    return {"window_hours": hours_back, "changes": changes_for_incident(ctx.incident, hours_back, keyword)}
 
 
 def get_retry_history(ctx: ToolContext) -> dict:
@@ -132,20 +149,25 @@ _REGISTRY = {
 }
 
 
+# Tools that read past incidents. Hidden when memory is OFF, so the "before" picture is honest:
+# without memory the agent has no access to the team's history at all.
+MEMORY_TOOLS = {"search_memory", "get_retry_history"}
+
+
 def tool_schemas(use_memory: bool) -> list[dict]:
     return [
         {"type": "function", "function": {"name": name, **schema}}
         for name, (_, schema) in _REGISTRY.items()
-        if use_memory or name != "search_memory"
+        if use_memory or name not in MEMORY_TOOLS
     ]
 
 
 def run_tool(ctx: ToolContext, name: str, arguments: str | None) -> str:
-    if name not in _REGISTRY or (name == "search_memory" and not ctx.use_memory):
+    if name not in _REGISTRY or (name in MEMORY_TOOLS and not ctx.use_memory):
         return json.dumps({"error": f"unknown tool {name}"})
     try:
         args = json.loads(arguments or "{}") or {}
         result = _REGISTRY[name][0](ctx, **args)
     except Exception as exc:  # bad args from the model must not crash the agent
         result = {"error": f"{type(exc).__name__}: {exc}"}
-    return json.dumps(result, default=str)[:6000]
+    return json.dumps(result, default=str)[:2500]  # tool output is resent on every later turn: keep it small
