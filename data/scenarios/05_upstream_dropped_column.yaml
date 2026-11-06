@@ -1,0 +1,25 @@
+# S05: Payments team drops fee_amount on Oct 20 (day 20). Once, then 2 related failures.
+id: S05
+name: upstream_table_dropped_column
+dag_id: marketing_attribution
+task_id: join_spend
+verdict: UPSTREAM_CHANGE
+error_class: AnalysisException
+error_lines:
+  - "pyspark.sql.utils.AnalysisException: cannot resolve 'fee_amount' given input columns: [txn_id, user_id, amount, currency, created_at]"
+core_frames:
+  - {file: "{path}/join_spend.py", fn: run, code: "spend = tx.select('txn_id', 'fee_amount', 'amount')"}
+  - {file: "/opt/spark/python/lib/pyspark.zip/pyspark/sql/dataframe.py", fn: select, code: "jdf = self._jdf.select(self._jcols(*cols))"}
+root_cause: "Payments team migration dropped payments.transactions.fee_amount (replaced by fees.fee_total)."
+fix: "Updated join_spend to read fees.fee_total instead of the dropped fee_amount column."
+minutes_to_resolve: {by_occurrence: [35, 8, 6]}
+auto_retry_passes: false
+schedule:
+  days: [20, 21, 23]
+  hour_range: [4, 6]
+caused_by_change:
+  type: schema_change
+  source: payments_team
+  once: true                    # one change-feed event; the 2 related failures point to it
+  lead_hours: 3
+  summary: "Team Payments altered payments.transactions: dropped fee_amount (moved to fees.fee_total)"

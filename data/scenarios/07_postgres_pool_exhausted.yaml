@@ -1,0 +1,24 @@
+# S07: overlapping backfill exhausts the Postgres connection pool.
+id: S07
+name: postgres_pool_exhausted
+dag_id: orders_etl
+task_id: extract_pg
+verdict: KNOWN_ISSUE
+error_class: OperationalError
+error_lines:
+  - "psycopg2.OperationalError: FATAL:  too many connections for role \"etl_orders\""
+core_frames:
+  - {file: "{path}/extract_pg.py", fn: run, code: "conn = psycopg2.connect(PG_DSN)"}
+  - {file: "/home/airflow/.local/lib/python3.11/site-packages/psycopg2/__init__.py", fn: connect, code: "conn = _connect(dsn, connection_factory=connection_factory, **kwasync)"}
+root_cause: "An overlapping backfill job was holding connection pool slots on pg-orders-primary."
+fix: "Paused the backfill DAG, waited for connections to drain, then re-ran extract_pg."
+minutes_to_resolve: {base: 12, jitter: 3}
+auto_retry_passes: false
+schedule:
+  days: [6, 14, 22]
+  hour_range: [1, 4]
+caused_by_change:
+  type: backfill
+  source: airflow
+  lead_hours: 0.5
+  summary: "Backfill orders_backfill_2026Q3 started (overlaps nightly orders_etl window)"
