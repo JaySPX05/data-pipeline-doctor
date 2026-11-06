@@ -1,7 +1,12 @@
 # One-command local stack: Hindsight + backend + frontend.  Owner: P7.
+#   cp .env.example .env      (add GROQ_API_KEY)
 #   docker compose up --build
-# Using Hindsight Cloud instead? Set HINDSIGHT_URL/HINDSIGHT_API_KEY in .env and run:
-#   docker compose up --build backend frontend
+#
+# Using Hindsight Cloud instead? In .env set:
+#   HINDSIGHT_URL_DOCKER=<your cloud URL>
+#   HINDSIGHT_API_KEY=<your key>
+# then run (--no-deps stops Compose from also starting the local hindsight):
+#   docker compose up --build --no-deps backend frontend
 
 services:
   hindsight:
@@ -17,19 +22,24 @@ services:
       # HINDSIGHT_API_LLM_GROQ_SERVICE_TIER: on_demand
     volumes:
       - hindsight-data:/home/hindsight/.pg0
+    restart: unless-stopped
 
   backend:
     build: ./backend
     ports:
       - "8000:8000"
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false      # compose still starts if .env is missing (needs Compose >= 2.24)
     environment:
       HINDSIGHT_URL: ${HINDSIGHT_URL_DOCKER:-http://hindsight:8888}
     volumes:
       - ./data:/app/data
+      - ./scripts:/app/scripts           # so `make seed` / `make replay` can run inside the container
       - ./backend/app:/app/backend/app   # hot reload
     depends_on:
       - hindsight
+    restart: unless-stopped
 
   frontend:
     build: ./frontend
@@ -42,6 +52,7 @@ services:
       - ./frontend/src:/app/src
     depends_on:
       - backend
+    restart: unless-stopped
 
 volumes:
   hindsight-data:
