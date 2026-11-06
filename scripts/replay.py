@@ -1,67 +1,85 @@
-"""Replay generated failures against the running API. This is the live part of the demo. Owner: P3.
+#!/usr/bin/env python3
+"""Replay failures live against the backend (POST /api/failures), in simulated time.
 
-    python scripts/replay.py --from-day 15 --to-day 30 --delay 2 --auto-feedback
+  python scripts/replay.py --speed 60x --auto-feedback          # days 15-30, agent learns as it goes
+  python scripts/replay.py --only S01 --from-day 15             # just the vendor-schema failures
+  python scripts/replay.py --only S09c --no-feedback            # correction moment: agent gets it wrong
+  python scripts/replay.py --only S09c                          # ...then re-run AFTER the engineer corrects
+  python scripts/replay.py --dry-run                            # print payloads, send nothing
 
---auto-feedback plays the on-call engineer: after each diagnosis it posts the ground
-truth as feedback (marking the agent right or wrong), so memory grows as the replay runs.
+--auto-feedback simulates the engineer: after each diagnosis it posts the ground-truth resolution, so
+Hindsight memory grows during days 15-30 (this is what makes the learning curve go up). Incidents with
+hold_feedback (the S09c wildcard) are never auto-confirmed.
 """
 from __future__ import annotations
 
 import argparse
-import json
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
-import httpx
-
-ROOT = Path(__file__).resolve().parents[1]
-COLORS = {"KNOWN_ISSUE": "\033[34m", "FLAKY": "\033[33m", "UPSTREAM_CHANGE": "\033[35m", "NEW": "\033[31m"}
-RESET = "\033[0m"
+sys.path.insert(0, str(Path(__file__).parent))
+import _common as C  # noqa: E402
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--api", default="http://localhost:8000")
-    ap.add_argument("--from-day", type=int, default=15)
-    ap.add_argument("--to-day", type=int, default=30)
-    ap.add_argument("--delay", type=float, default=1.0, help="Seconds between events")
-    ap.add_argument("--auto-feedback", action="store_true")
-    args = ap.parse_args()
+def parse_speed(s: str) -> float:
+    return float(s.lower().rstrip("x"))
 
-    history = [json.loads(line) for line in (ROOT / "data/generated/history.jsonl").read_text().splitlines() if line.strip()]
-    todo = [h for h in history if args.from_day <= h["day"] <= args.to_day]
-    print(f"Replaying {len(todo)} failures (days {args.from_day}-{args.to_day}) against {args.api}\n")
 
-    correct = 0
-    with httpx.Client(base_url=args.api, timeout=120) as client:
-        for item in todo:
-            ev, truth = item["event"], item["truth"]
-            incident = client.post("/api/failures", json=ev).raise_for_status().json()
-            dx = incident["diagnosis"]
-            hit = dx["verdict"] == truth["verdict"]
-            correct += hit
-            color = COLORS.get(dx["verdict"], "")
-            print(
-                f"day {item['day']:>2}  {ev['dag_id'] + '.' + ev['task_id']:<36} "
-                f"{color}{dx['verdict']:<16}{RESET} conf={dx['confidence']:.2f}  "
-                f"mem={len(dx['evidence'])}  {dx['latency_ms']:>5}ms  {'OK' if hit else 'MISS (truth: ' + truth['verdict'] + ')'}"
-            )
-            if args.auto_feedback:
-                client.post(
-                    f"/api/incidents/{incident['id']}/feedback",
-                    json={
-                        "correct": hit,
-                        "root_cause": truth["root_cause"],
-                        "fix": truth["fix"],
-                        "verdict": truth["verdict"],
-                        "minutes_to_fix": truth.get("minutes_to_fix"),
-                        "engineer": "replay-bot",
-                    },
-                ).raise_for_status()
-            time.sleep(args.delay)
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--speed", default="60x", help="simulated time multiplier, e.g. 60x or 3600x")
+    ap.add_argument("--max-gap", type=float, default=3.0, help="never sleep longer than this many real seconds")
+    ap.add_argument("--base-url", default="http://localhost:8000")
+    ap.add_argument("--from-day", type=int, default=C.REPLAY_DAYS[0])
+    ap.add_argument("--to-day", type=int, default=C.REPLAY_DAYS[1])
+    ap.add_argument("--only", help="comma-separated scenario ids, e.g. S01,S02,S09c")
+    ap.add_argument("--repeat", type=int, default=1, help="send the selected set N times")
+    ap.add_argument("--auto-feedback", action="store_true", help="post ground-truth feedback after each diagnosis")
+    ap.add_argument("--no-feedback", action="store_true", help="never post feedback (overrides --auto-feedback)")
+    ap.add_argument("--feedback-delay", type=float, default=1.5, help="seconds to wait for diagnosis before feedback")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
 
-    if todo:
-        print(f"\nVerdict accuracy: {correct}/{len(todo)} ({100 * correct / len(todo):.0f}%)")
+    speed = parse_speed(a.speed)
+    only = set(a.only.split(",")) if a.only else None
+    rows = [i for i in C.read_jsonl(C.INCIDENTS_PATH)
+            if a.from_day <= i["day"] <= a.to_day and (not only or i["scenario_id"] in only)]
+    rows.sort(key=lambda i: i["failed_at"])
+    if not rows:
+        sys.exit("No incidents match those filters.")
+    print(f"Replaying {len(rows)} failures x{a.repeat} at {a.speed} -> {a.base_url}")
+
+    sent = 0
+    for rep in range(a.repeat):
+        prev = None
+        for inc in rows:
+            t = datetime.fromisoformat(inc["failed_at"])
+            if prev is not None and not a.dry_run:
+                time.sleep(min(max((t - prev).total_seconds() / speed, 0.0), a.max_gap))
+            prev = t
+            label = f"[day {inc['day']:>2} {t:%H:%M}] {inc['incident_id']} {inc['dag_id']}.{inc['task_id']}"
+            body = C.failure_payload(inc)
+            if a.dry_run:
+                print(f"{label}  (truth: {inc['truth']['verdict']}, {inc['scenario_id']})")
+                continue
+            try:
+                resp = C.http_json("POST", f"{a.base_url}/api/failures", body)
+            except Exception as e:
+                print(f"{label}  POST failed: {type(e).__name__}: {e}")
+                continue
+            sent += 1
+            new_id = resp.get("incident_id") or resp.get("id")
+            verdict = resp.get("verdict") or (resp.get("diagnosis") or {}).get("verdict") or "?"
+            print(f"{label} -> {new_id}  agent: {verdict}  truth: {inc['truth']['verdict']}")
+            if a.auto_feedback and not a.no_feedback and not inc["hold_feedback"] and new_id:
+                time.sleep(a.feedback_delay)
+                try:
+                    C.http_json("POST", f"{a.base_url}/api/incidents/{new_id}/feedback", C.feedback_payload(inc))
+                except Exception as e:
+                    print(f"      feedback failed: {type(e).__name__}: {e}")
+    print(f"Done. Sent {sent} failures.")
 
 
 if __name__ == "__main__":

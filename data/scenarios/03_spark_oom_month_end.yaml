@@ -1,0 +1,22 @@
+# S03: Spark OOM on month-end volume. Day 1 = September month-end close (gives the agent history).
+id: S03
+name: spark_oom_month_end
+dag_id: payments_daily
+task_id: aggregate
+verdict: KNOWN_ISSUE
+error_class: OutOfMemoryError
+error_lines:
+  - "py4j.protocol.Py4JJavaError: An error occurred while calling o{objid}.save."
+  - ": java.lang.OutOfMemoryError: Java heap space"
+core_frames:
+  - {file: "{path}/aggregate.py", fn: run, code: "daily.write.mode('overwrite').parquet(out_path)"}
+  - {file: "/opt/spark/python/lib/pyspark.zip/pyspark/sql/readwriter.py", fn: parquet, code: "self._jwrite.parquet(path)"}
+root_cause: "Month-end volume spike (~{rows} rows) exceeded Spark executor memory."
+fix: "Raised spark.executor.memory from 8g to 16g for the month-end run and re-ran aggregate."
+minutes_to_resolve: {base: 22, jitter: 6}
+auto_retry_passes: false
+schedule:
+  days: [1, 28, 29, 30]
+  hour_range: [1, 3]
+variables:
+  rows: {type: int, range: [4000000, 9000000]}

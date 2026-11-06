@@ -1,0 +1,78 @@
+# S09: 5 one-off wildcards (verdict NEW). Each variant is its own scenario id.
+# S09c is the CORRECTION demo incident: day 16, hold_feedback => replay.py does NOT auto-confirm it.
+#   Demo flow: replay shows the agent miss it -> engineer corrects in the UI -> `replay.py --only S09c`.
+base:
+  verdict: NEW
+  auto_retry_passes: false
+variants:
+  - id: S09a
+    name: wildcard_expired_tls_cert
+    day: 5
+    hour_range: [2, 5]
+    dag_id: customer_360
+    task_id: enrich_geo
+    error_class: SSLError
+    error_lines:
+      - "requests.exceptions.SSLError: HTTPSConnectionPool(host='geo.mapvendor.io', port=443): certificate verify failed: certificate has expired"
+    core_frames:
+      - {file: "{path}/enrich_geo.py", fn: run, code: "resp = session.get(GEO_URL, params=params, timeout=30)"}
+    root_cause: "The geocoding vendor's TLS certificate expired; our pinned CA bundle rejected it."
+    fix: "Vendor renewed the cert; we refreshed the pinned CA bundle and re-ran enrich_geo."
+    minutes_to_resolve: {base: 40, jitter: 5}
+  - id: S09b
+    name: wildcard_malformed_json_batch
+    day: 9
+    hour_range: [3, 6]
+    dag_id: events_ingest
+    task_id: parse_events
+    error_class: JSONDecodeError
+    error_lines:
+      - "json.decoder.JSONDecodeError: Expecting value: line {ln2} column 1 (char {ch})"
+    core_frames:
+      - {file: "{path}/parse_events.py", fn: run, code: "event = json.loads(line)"}
+    root_cause: "A mobile app release emitted truncated event batches (partial JSON lines)."
+    fix: "Added a skip-and-quarantine path for malformed lines and asked the mobile team to patch the SDK."
+    minutes_to_resolve: {base: 55, jitter: 8}
+  - id: S09c
+    name: wildcard_locale_number_format
+    day: 16
+    hour_range: [3, 4]
+    hold_feedback: true
+    dag_id: payments_daily
+    task_id: reconcile
+    error_class: ValueError
+    error_lines:
+      - "ValueError: could not convert string to float: '1,299.00'"
+    core_frames:
+      - {file: "{path}/reconcile.py", fn: run, code: "amounts = [float(r['settled_amount']) for r in rows]"}
+    root_cause: "The finance team's bank export switched to thousands-separator formatting (1,299.00), breaking float parsing."
+    fix: "Strip thousands separators before parsing settled_amount and asked finance to restore the plain-number export."
+    minutes_to_resolve: {base: 30, jitter: 4}
+  - id: S09d
+    name: wildcard_volume_permissions
+    day: 22
+    hour_range: [2, 5]
+    dag_id: marketing_attribution
+    task_id: load_campaigns
+    error_class: PermissionError
+    error_lines:
+      - "PermissionError: [Errno 13] Permission denied: '/mnt/data/campaigns/latest.csv'"
+    core_frames:
+      - {file: "{path}/load_campaigns.py", fn: run, code: "with open(CAMPAIGN_PATH) as f:"}
+    root_cause: "A Kubernetes node upgrade remounted the campaigns volume with different file ownership."
+    fix: "Reset ownership on the campaigns volume (chown to the airflow uid) and re-ran load_campaigns."
+    minutes_to_resolve: {base: 25, jitter: 4}
+  - id: S09e
+    name: wildcard_redis_failover
+    day: 25
+    hour_range: [3, 6]
+    dag_id: orders_etl
+    task_id: publish_orders
+    error_class: ConnectionError
+    error_lines:
+      - "redis.exceptions.ConnectionError: Error 111 connecting to redis-cache-prod:6379. Connection refused."
+    core_frames:
+      - {file: "{path}/publish_orders.py", fn: run, code: "cache.set(key, payload, ex=3600)"}
+    root_cause: "Planned Redis primary failover during the nightly maintenance window."
+    fix: "Waited for the replica promotion to finish and re-ran publish_orders."
+    minutes_to_resolve: {base: 15, jitter: 3}

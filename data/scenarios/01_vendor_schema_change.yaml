@@ -1,44 +1,26 @@
-# Scenario 1: vendor renames a column in their order feed -> load_orders breaks.
-# Use this file as the template for the other scenarios (see data/README.md).
-id: vendor_schema_change
-name: Vendor schema change
+# S01: vendor renames a column after each feed release. Demo "Memory ON" moment.
+id: S01
+name: vendor_schema_change
 dag_id: orders_etl
 task_id: load_orders
-operator: PythonOperator
-
-# Ground truth: used by replay.py --auto-feedback to play the engineer.
-truth:
-  verdict: UPSTREAM_CHANGE
-  root_cause: "Vendor FreshFarm renamed column customer_id to cust_id in order feed v{vendor_version}"
-  fix: "Map cust_id -> customer_id in config/vendor_schema.yaml and re-run load_orders"
-  minutes_to_fix: [45, 12, 5, 4]   # one value per occurrence: slow the first time, fast once remembered
-
-# Days (1-30) on which this failure happens, and the hour (UTC).
-days: [3, 11, 19, 27]
-hour: 3
-
-# Optional upstream change published a few hours BEFORE each failure (goes to change_feed.jsonl).
-change_event:
+verdict: UPSTREAM_CHANGE
+error_class: KeyError
+error_lines:
+  - "KeyError: 'customer_id'"
+core_frames:
+  - {file: "{path}/load_orders.py", fn: run, code: "df = df[REQUIRED_COLUMNS]"}
+  - {file: "{path}/load_orders.py", fn: select_columns, code: "return frame['customer_id']"}
+root_cause: "Vendor feed v{version} renamed customer_id to cust_id."
+fix: "Updated the column mapping in vendor_schema.yaml (customer_id -> cust_id) and re-ran load_orders."
+minutes_to_resolve: {base: 4, jitter: 1}
+auto_retry_passes: false
+schedule:
+  days: [3, 12, 19, 27]      # 2 in the seeded past (3, 12), 2 replayed live (19, 27)
+  hour_range: [2, 4]
+caused_by_change:
   type: vendor_release
-  hours_before: 5
-  affects_dags: [orders_etl]
-  text: "Vendor FreshFarm released order feed v{vendor_version}: column customer_id renamed to cust_id."
-
-vars:
-  vendor_version: ["2.3", "2.4", "2.5", "2.6"]   # lists are picked in order of occurrence when 'sequential: true'
-  host: ["ip-10-0-3-17", "ip-10-0-4-92", "ip-10-0-1-55"]
-  rows: "int:12000-95000"
-  line: "int:84-96"
-sequential: [vendor_version]
-
-log_template: |
-  [{ts}] {{taskinstance.py:1937}} INFO - Executing <Task(PythonOperator): load_orders> on {run_id}
-  [{ts}] {{load.py:41}} INFO - Reading s3://qb-landing/freshfarm/orders/{date}/part-0000.parquet from {host}
-  [{ts}] {{load.py:57}} INFO - Loaded {rows} rows, 23 columns
-  [{ts}] {{taskinstance.py:1937}} ERROR - Task failed with exception
-  Traceback (most recent call last):
-    File "/opt/airflow/dags/orders/load.py", line {line}, in load_orders
-      df["customer_id"] = df["customer_id"].astype("int64")
-    File "/usr/local/lib/python3.11/site-packages/pandas/core/frame.py", line 4102, in __getitem__
-      indexer = self.columns.get_loc(key)
-  KeyError: 'customer_id'
+  source: vendor_feed
+  lead_hours: 2
+  summary: "Vendor feed v{version} released: customer_id renamed to cust_id"
+variables:
+  version: {type: seq, prefix: "2.", start: 3}

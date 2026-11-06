@@ -1,75 +1,91 @@
-"""Load the agent's 'past' (days 1..N of history) straight into Hindsight. Owner: P2 + P3.
+#!/usr/bin/env python3
+"""Load the agent's "past" (days 1-14) into Hindsight.
 
-    python scripts/seed_memory.py --until-day 14
+Retains, per incident: the failure event + (confirmed resolution OR flaky retry outcome),
+plus every change-feed event in the window. Each retain has context, timestamp, document_id,
+metadata and tags (dag:, task:, fp:, kind:). Idempotent: re-running updates the same documents.
 
-Retains, per historical failure: the failure event + the engineer's confirmed resolution,
-plus every change-feed entry up to that day. No LLM agent calls, so it is fast.
-Use scripts/replay.py for the days you want to show live in the demo.
+  python scripts/seed_memory.py --dry-run          # print what would be retained
+  python scripts/seed_memory.py                    # seed days 1-14
+  python scripts/seed_memory.py --workers 8        # faster (Hindsight runs LLM extraction per retain)
 """
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-from datetime import datetime, timedelta
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "backend"))
-
-from app.memory.hindsight_store import MemoryStore  # noqa: E402
-from app.models.schemas import Diagnosis, Feedback, Incident, Verdict  # noqa: E402
-from app.services.fingerprint import fingerprint  # noqa: E402
+sys.path.insert(0, str(Path(__file__).parent))
+import _common as C  # noqa: E402
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--until-day", type=int, default=14)
-    args = ap.parse_args()
+def build_items(day_from: int, day_to: int) -> list[dict]:
+    incidents = [i for i in C.read_jsonl(C.INCIDENTS_PATH) if day_from <= i["day"] <= day_to]
+    changes = [c for c in C.read_jsonl(C.CHANGES_PATH) if day_from <= c["day"] <= day_to]
+    items = [it for inc in incidents for it in C.memory_items(inc)] + [C.change_memory_item(c) for c in changes]
+    return sorted(items, key=lambda it: it["timestamp"])
 
-    gen = ROOT / "data" / "generated"
-    history = [json.loads(line) for line in (gen / "history.jsonl").read_text().splitlines() if line.strip()]
-    changes = [json.loads(line) for line in (gen / "change_feed.jsonl").read_text().splitlines() if line.strip()]
-    past = [h for h in history if h["day"] <= args.until_day]
-    if not past:
-        sys.exit("No history found. Run scripts/generate_history.py first.")
-    cutoff = datetime.fromisoformat(past[-1]["event"]["occurred_at"]) + timedelta(days=1)
 
-    store = MemoryStore()
-    for change in changes:
-        if datetime.fromisoformat(change["at"]) <= cutoff:
-            store.retain_change(change)
+def retain_one(client, bank_id: str, it: dict) -> None:
+    kw = dict(bank_id=bank_id, content=it["content"], context=it["context"],
+              timestamp=datetime.fromisoformat(it["timestamp"]), document_id=it["document_id"],
+              metadata={k: str(v) for k, v in it["metadata"].items()})   # Hindsight metadata = str -> str
+    for attempt in range(3):
+        try:
+            try:
+                client.retain(tags=it["tags"], **kw)
+            except TypeError:                     # older client without tags support
+                client.retain(**kw)
+            return
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(1.5 * (attempt + 1))
 
-    for i, item in enumerate(past, 1):
-        ev, truth = item["event"], item["truth"]
-        fp, err_cls, err_msg = fingerprint(ev["task_id"], ev["log_tail"])
-        verdict = Verdict(truth["verdict"])
-        incident = Incident(
-            id=f"seed_{i:03d}",
-            dag_id=ev["dag_id"],
-            task_id=ev["task_id"],
-            run_id=ev["run_id"],
-            try_number=ev["try_number"],
-            occurred_at=datetime.fromisoformat(ev["occurred_at"]),
-            error_class=err_cls,
-            error_message=err_msg,
-            fingerprint=fp,
-            log_tail=ev["log_tail"],
-            diagnosis=Diagnosis(verdict=verdict, root_cause=truth["root_cause"], suggested_fix=truth["fix"], confidence=1.0),
-        )
-        store.retain_failure(incident)
-        store.retain_feedback(
-            incident,
-            Feedback(correct=True, root_cause=truth["root_cause"], fix=truth["fix"], verdict=verdict, minutes_to_fix=truth.get("minutes_to_fix")),
-            resolved_at=incident.occurred_at + timedelta(minutes=truth.get("minutes_to_fix") or 15),
-        )
-        print(f"[{i}/{len(past)}] day {item['day']:>2}  {ev['dag_id']}.{ev['task_id']}  {fp}  {verdict.value}")
 
-    status = store.status()
-    if status["last_error"]:
-        sys.exit(f"Hindsight error: {status['last_error']}")
-    print(f"Seeded {len(past)} incidents into bank '{store.bank_id}'.")
+def run(day_from=C.SEED_DAYS[0], day_to=C.SEED_DAYS[1], bank_id=C.BANK_ID, base_url=None,
+        api_key=None, workers=4, dry_run=False) -> int:
+    items = build_items(day_from, day_to)
+    kinds = {}
+    for it in items:
+        k = next(t for t in it["tags"] if t.startswith("kind:"))
+        kinds[k] = kinds.get(k, 0) + 1
+    print(f"Days {day_from}-{day_to}: {len(items)} retains for bank '{bank_id}' {kinds}")
+    if dry_run:
+        for it in items[:6]:
+            print(f"  [{it['timestamp']}] {it['document_id']}  {it['tags']}\n      {it['content']}")
+        print("  ... (dry run, nothing sent)")
+        return len(items)
+    client = C.get_hindsight(base_url, api_key)
+    C.ensure_bank(client, bank_id)
+    done, failed = 0, []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(retain_one, client, bank_id, it): it for it in items}
+        for f in futs:
+            try:
+                f.result()
+                done += 1
+                if done % 20 == 0:
+                    print(f"  {done}/{len(items)} retained")
+            except Exception as e:
+                failed.append((futs[f]["document_id"], f"{type(e).__name__}: {e}"))
+    print(f"Done: {done} retained, {len(failed)} failed")
+    for doc, err in failed[:10]:
+        print(f"  FAILED {doc}: {err}")
+    return done
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--from-day", type=int, default=C.SEED_DAYS[0])
+    ap.add_argument("--to-day", type=int, default=C.SEED_DAYS[1])
+    ap.add_argument("--bank-id", default=C.BANK_ID)
+    ap.add_argument("--base-url", default=None, help="default: $HINDSIGHT_URL or http://localhost:8888")
+    ap.add_argument("--api-key", default=None)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    sys.exit(0 if run(a.from_day, a.to_day, a.bank_id, a.base_url, a.api_key, a.workers, a.dry_run) else 1)
