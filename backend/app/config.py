@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     log_tail_lines: int = 40         # log lines sent to the model
     max_rate_limit_wait_s: float = 20.0  # longest we wait on a 429 Retry-After before falling back
 
+    # Google Gemini (AI Studio) as a fallback provider, on its own quota. Empty key = off.
+    gemini_api_key: str = ""
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    gemini_model: str = "gemini-3.5-flash"  # copy the exact id from AI Studio
+
     # Hindsight memory
     hindsight_url: str = "http://localhost:8888"
     hindsight_api_key: str = ""  # only needed for Hindsight Cloud

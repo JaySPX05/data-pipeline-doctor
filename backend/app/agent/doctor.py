@@ -112,15 +112,19 @@ def _incident_prompt(
     )
 
 
+def _tool_call_dict(tc) -> dict:
+    """Serialise a tool call for the next turn, keeping provider extras (Gemini thought signatures)."""
+    if hasattr(tc, "model_dump"):
+        return tc.model_dump(exclude_none=True)
+    out = {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+    extra = getattr(tc, "extra_content", None)
+    if extra:
+        out["extra_content"] = extra
+    return out
+
+
 def _assistant_tool_message(msg) -> dict:
-    return {
-        "role": "assistant",
-        "content": msg.content or "",
-        "tool_calls": [
-            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in msg.tool_calls
-        ],
-    }
+    return {"role": "assistant", "content": msg.content or "", "tool_calls": [_tool_call_dict(tc) for tc in msg.tool_calls]}
 
 
 class FailureDoctor:
@@ -164,7 +168,7 @@ class FailureDoctor:
                 trace.fallback = f"heuristic ({type(exc).__name__}: {str(exc)[:160]})"
                 log.error("LLM diagnosis failed for %s, using heuristic: %s", incident.id, exc)
         else:
-            trace.fallback = "heuristic (no GROQ_API_KEY)"
+            trace.fallback = "heuristic (no GROQ_API_KEY or GEMINI_API_KEY)"
         if diagnosis is None:
             diagnosis = self._heuristic(incident, evidence)
 
@@ -179,6 +183,7 @@ class FailureDoctor:
         result = self.llm.chat(messages, **kwargs)
         trace.llm_calls.append(
             {
+                "provider": result.provider,
                 "model": result.model,
                 "attempts": result.attempts,
                 "salvaged": result.salvaged,

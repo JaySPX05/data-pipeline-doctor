@@ -120,7 +120,9 @@ def main() -> None:
     init_db()
     doctor = FailureDoctor(store=MemoryStore(), llm=LLMClient())
     if not doctor.llm.available and not args.json:
-        print(f"{RED}No GROQ_API_KEY: using the offline heuristic. Add the key to .env for real diagnoses.{RESET}")
+        print(f"{RED}No GROQ_API_KEY or GEMINI_API_KEY: using the offline heuristic. Add a key to .env for real diagnoses.{RESET}")
+    elif not args.json:
+        print(f"{DIM}LLM chain: {' -> '.join(doctor.llm.describe())}{RESET}")
 
     results, correct, total = [], 0, 0
     with SessionLocal() as session:

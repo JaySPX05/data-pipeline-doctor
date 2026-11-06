@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from app.agent.doctor import FailureDoctor
@@ -20,13 +20,21 @@ def _get_or_404(session: Session, incident_id: str) -> Incident:
 
 @router.get("", response_model=list[Incident])
 def list_incidents(
-    status: str | None = None,
-    verdict: str | None = None,
+    response: Response,
+    status: str | None = Query(None, description="open / diagnosed / resolved"),
+    verdict: str | None = Query(None, description="KNOWN_ISSUE / FLAKY / UPSTREAM_CHANGE / NEW"),
     dag_id: str | None = None,
-    limit: int = Query(200, le=1000),
+    q: str | None = Query(None, description="Search task, DAG, error class, error message or fingerprint"),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     session: Session = Depends(get_session),
 ):
-    return svc.list_incidents(session, status=status, verdict=verdict, dag_id=dag_id, limit=limit)
+    """Incident inbox, newest first. Total matching count is in the X-Total-Count header."""
+    items, total = svc.list_incidents(
+        session, status=status, verdict=verdict, dag_id=dag_id, q=q, limit=limit, offset=offset
+    )
+    response.headers["X-Total-Count"] = str(total)
+    return items
 
 
 @router.get("/{incident_id}", response_model=Incident)

@@ -6,7 +6,7 @@ and update frontend/src/mocks/incidents.js in the same PR.
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Verdict(str, Enum):
@@ -24,6 +24,23 @@ class IncidentStatus(str, Enum):
 
 class FailureEvent(BaseModel):
     """What a scheduler (Airflow callback or our simulator) posts to /api/failures."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "dag_id": "orders_etl",
+                    "task_id": "load_orders",
+                    "run_id": "scheduled__2026-10-19T03:00:00+00:00",
+                    "try_number": 1,
+                    "occurred_at": "2026-10-19T03:12:44+00:00",
+                    "log_tail": "Traceback (most recent call last):\n  File \"/opt/airflow/dags/orders/load.py\", line 88, in load_orders\n    df[\"customer_id\"] = df[\"customer_id\"].astype(\"int64\")\nKeyError: 'customer_id'",
+                    "operator": "PythonOperator",
+                    "recent_changes": [],
+                }
+            ]
+        }
+    )
 
     dag_id: str
     task_id: str
@@ -63,6 +80,21 @@ class Diagnosis(BaseModel):
 
 
 class Feedback(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "correct": False,
+                    "root_cause": "Vendor FreshFarm renamed customer_id to cust_id in order feed v2.5",
+                    "fix": "Map cust_id -> customer_id in config/vendor_schema.yaml and re-run load_orders",
+                    "verdict": "UPSTREAM_CHANGE",
+                    "minutes_to_fix": 4,
+                    "engineer": "jay",
+                }
+            ]
+        }
+    )
+
     correct: bool
     root_cause: str
     fix: str
