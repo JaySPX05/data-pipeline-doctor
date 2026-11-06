@@ -66,7 +66,7 @@ No API keys yet? The backend runs offline: the agent falls back to a rule-based 
 `openai/gpt-oss-120b` on the free plan allows 30 requests/min, 8K tokens/min and 200K tokens/day, per organization (not per key). The agent is tuned for this: changes and task history are prefetched so most diagnoses are a single ~2K-token call, gpt-oss runs with `reasoning_effort=low`, and on a 429 it waits for Groq's `Retry-After` (up to 20 s) before falling back to `openai/gpt-oss-20b`.
 
 - Each teammate should use a key from their **own** Groq account while developing; keys from one org share one quota.
-- **Gemini fallback (optional):** set `GEMINI_API_KEY` in `.env` and the agent's chain becomes Groq `gpt-oss-120b` → Gemini (`GEMINI_MODEL`, its own quota) → Groq `gpt-oss-20b`. Check the chain with `curl localhost:8000/api/health`. To give Hindsight the same fallback, copy `docker-compose.override.example.yml` to `docker-compose.override.yml`.
+- **Gemini fallback (optional):** set `GEMINI_API_KEY` in `.env` and the agent's chain becomes Groq `gpt-oss-120b` → Gemini (`GEMINI_MODEL`, its own quota) → Groq `gpt-oss-20b`. Check the chain at http://localhost:8000/api/health (browser, `curl http://localhost:8000/api/health`, or on Windows PowerShell `Invoke-RestMethod http://localhost:8000/api/health`). To give Hindsight the same fallback, copy `docker-compose.override.example.yml` to `docker-compose.override.yml`.
 - For the demo, consider the pay-as-you-go Developer plan (much higher limits, cents of usage).
 - `model_not_found`? A model id was retired: check `LLM_MODEL` / `LLM_FALLBACK_MODEL` in your `.env` against https://console.groq.com/docs/models.
 
