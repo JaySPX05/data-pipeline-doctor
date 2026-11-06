@@ -94,13 +94,14 @@ docs/                  team split, content checklist                       (P7)
 | Method + path | Purpose |
 | --- | --- |
 | `POST /api/failures` | Ingest a failure, diagnose it, return the incident |
-| `GET /api/incidents` | Inbox (`status`, `verdict`, `dag_id` filters) |
+| `GET /api/incidents` | Inbox, newest first: `status`, `verdict`, `dag_id`, `q` (search), `limit`, `offset`; total in `X-Total-Count` |
 | `GET /api/incidents/{id}` | Incident + diagnosis card |
 | `POST /api/incidents/{id}/feedback` | Confirm/correct → retained in Hindsight |
 | `POST /api/incidents/{id}/rediagnose?memory=false` | Same incident without memory (before/after) |
 | `GET /api/memory/search?q=` | Recall from the bank |
 | `POST /api/reflect` | Pipeline Health Brief |
 | `GET /api/metrics/learning-curve` | Auto-diagnosed % and accuracy per day |
+| `GET /api/metrics/summary` | KPI tiles: totals by verdict, accuracy, pages avoided, MTTR per day, first vs latest day |
 
 Interactive docs: http://localhost:8000/docs
 

@@ -29,6 +29,7 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Total-Count", "Server-Timing"],
 )
 
 for router in (failures.router, incidents.router, memory.router, metrics.router):
