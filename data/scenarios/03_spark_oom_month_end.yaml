@@ -7,7 +7,7 @@ verdict: KNOWN_ISSUE
 error_class: OutOfMemoryError
 error_lines:
   - "py4j.protocol.Py4JJavaError: An error occurred while calling o{objid}.save."
-  - ": java.lang.OutOfMemoryError: Java heap space"
+  - "java.lang.OutOfMemoryError: Java heap space"
 core_frames:
   - {file: "{path}/aggregate.py", fn: run, code: "daily.write.mode('overwrite').parquet(out_path)"}
   - {file: "/opt/spark/python/lib/pyspark.zip/pyspark/sql/readwriter.py", fn: parquet, code: "self._jwrite.parquet(path)"}

@@ -41,7 +41,25 @@ def test_different_scenarios_different_fingerprints():
 
 def test_stored_fingerprint_matches_recompute():
     for r in INC:
-        assert C.fingerprint_log(r["log_tail"]) == r["fingerprint"], r["incident_id"]
+        assert C.fingerprint_log(r["log_tail"], r["task_id"]) == r["fingerprint"], r["incident_id"]
+
+
+def test_uses_real_backend_fingerprinter():
+    assert C.fingerprint_backend_name().startswith("backend"), "backend/app/services/fingerprint.py not found"
+
+
+def test_backend_reads_intended_error_class():
+    for r in INC:
+        got = C.backend_extract_error(r["log_tail"])
+        assert got and got[0] == r["error_class"], f"{r['incident_id']}: {got} vs {r['error_class']}"
+
+
+def test_payloads_match_frozen_schema():
+    p = C.failure_payload(INC[0])
+    assert {"dag_id", "task_id", "run_id", "try_number", "occurred_at", "log_tail", "recent_changes"} <= set(p)
+    assert all(isinstance(x, str) for x in p["recent_changes"])
+    f = C.feedback_payload(INC[0], correct=False)
+    assert isinstance(f["correct"], bool) and {"root_cause", "fix"} <= set(f)
 
 
 def test_logs_are_not_identical():
@@ -107,7 +125,7 @@ def test_memory_items_well_formed():
         for it in C.memory_items(r):
             assert it["content"] and it["context"] and it["document_id"] and it["timestamp"]
             assert {"dag_id", "task_id", "fingerprint"} <= set(it["metadata"])
-            assert any(t.startswith("kind:") for t in it["tags"]) and f"fp:{r['fingerprint']}" in it["tags"]
+            assert any(t in ("kind:failure", "kind:resolution", "kind:correction", "kind:change") for t in it["tags"]) and f"fp:{r['fingerprint']}" in it["tags"]
 
 
 if __name__ == "__main__":          # tiny runner so it works without pytest

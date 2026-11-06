@@ -246,7 +246,7 @@ def build(seed=42, use_llm=False, stack_variation=True):
             if timedelta(0) <= t0 - datetime.fromisoformat(c["ts"]) <= timedelta(hours=24)
             and any(a == f"{inc['dag_id']}.{inc['task_id']}" or a.startswith(inc["dag_id"] + ".") for a in c["affects"])
         ]
-        inc["fingerprint"] = C.fingerprint_log(inc["log_tail"])
+        inc["fingerprint"] = C.fingerprint_log(inc["log_tail"], inc["task_id"])
         seen[inc["fingerprint"]] += 1
         inc["occurrence"] = seen[inc["fingerprint"]]
         for k in ("_sc", "_vars", "_occ"):
@@ -273,6 +273,12 @@ def check(incidents) -> list[str]:
     for sid, fps in by_sc.items():
         if len(fps) > 1:
             problems.append(f"{sid}: {len(fps)} different fingerprints (log variation leaked into the fingerprint)")
+    for i in incidents:       # the agent must see the error class we intended
+        got = C.backend_extract_error(i["log_tail"])
+        if got and got[0] != i["error_class"]:
+            problems.append(f"{i['incident_id']} ({i['scenario_id']}): backend reads error class "
+                            f"{got[0]!r}, scenario says {i['error_class']!r}")
+            break
     owner = {}
     for sid, fps in by_sc.items():
         for fp in fps:

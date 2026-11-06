@@ -70,13 +70,25 @@ def main():
                 print(f"{label}  POST failed: {type(e).__name__}: {e}")
                 continue
             sent += 1
-            new_id = resp.get("incident_id") or resp.get("id")
-            verdict = resp.get("verdict") or (resp.get("diagnosis") or {}).get("verdict") or "?"
-            print(f"{label} -> {new_id}  agent: {verdict}  truth: {inc['truth']['verdict']}")
-            if a.auto_feedback and not a.no_feedback and not inc["hold_feedback"] and new_id:
-                time.sleep(a.feedback_delay)
+            new_id = resp.get("id") or resp.get("incident_id")
+            agent = (resp.get("diagnosis") or {}).get("verdict") or resp.get("verdict")
+            truth = inc["truth"]["verdict"]
+            want_feedback = a.auto_feedback and not a.no_feedback and not inc["hold_feedback"] and new_id
+            if want_feedback:
+                time.sleep(a.feedback_delay)           # let the (async) diagnosis finish
+                if not agent:
+                    try:
+                        got = C.http_json("GET", f"{a.base_url}/api/incidents/{new_id}")
+                        agent = (got.get("diagnosis") or {}).get("verdict")
+                    except Exception:
+                        pass
+            print(f"{label} -> {new_id}  agent: {agent or '?'}  truth: {truth}")
+            if want_feedback:
+                correct = (agent == truth)             # decides confirmed-resolution vs correction
                 try:
-                    C.http_json("POST", f"{a.base_url}/api/incidents/{new_id}/feedback", C.feedback_payload(inc))
+                    C.http_json("POST", f"{a.base_url}/api/incidents/{new_id}/feedback",
+                                C.feedback_payload(inc, correct=correct))
+                    print(f"      feedback sent (correct={correct})")
                 except Exception as e:
                     print(f"      feedback failed: {type(e).__name__}: {e}")
     print(f"Done. Sent {sent} failures.")

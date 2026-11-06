@@ -4,7 +4,7 @@ name: dq_check_failed
 dag_id: inventory_sync
 task_id: dq_checks
 verdict: FLAKY
-error_class: ExpectationFailed
+error_class: AssertionError
 error_lines:
   - "AssertionError: Great Expectations validation failed: expect_column_values_to_not_be_null on column 'sku_id' ({pct} percent unexpected)"
 core_frames:
