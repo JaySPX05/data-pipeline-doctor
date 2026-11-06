@@ -55,7 +55,7 @@ Task: make the diagnosis agent work end to end against real Groq.
 Read backend/app/agent/doctor.py, llm.py, tools.py and prompts/diagnose_system.md.
 1. Add backend/app/agent/__main__.py so `python -m app.agent <path-to-log.txt>` runs
    FailureDoctor on a log file with MEMORY_ENABLED=false and prints the Diagnosis JSON.
-2. Run it on the logs in data/generated/history.jsonl (one per scenario).
+2. Run it on the logs in data/generated/incidents.jsonl (one per scenario; app/services/demo_data.py loads them).
 3. Groq can return 400 tool_use_failed or reply with prose instead of JSON. Make sure
    llm.chat() and extract_json() handle both, and log which model and how many tool steps
    each diagnosis used.
@@ -136,7 +136,7 @@ the real method signatures with Python's inspect module instead of guessing them
 Task: measure and improve recall quality in hindsight_store.recall_for_incident().
 The bank is seeded with days 1-14 (scripts/seed_memory.py). Write
 backend/app/memory/recall_eval.py: for every event with day >= 15 in
-data/generated/history.jsonl, build the Incident (use services/fingerprint.py), call
+data/generated/incidents.jsonl, build the Incident (use services/demo_data.to_incident), call
 recall_for_incident(), and record whether the top 3 results mention the same fingerprint
 or the same root cause as truth.root_cause. Print hit@3 per scenario and the average
 latency. Then try at most 3 variations (budget low/mid/high, tag scoping on/off, query
@@ -227,8 +227,8 @@ Jay: input, expected, actual.
 
 ```text
 Task: build backend/app/agent/eval.py, run with `python -m app.agent.eval`.
-For each event in data/generated/history.jsonl with day >= 15: build the Incident (use
-services/fingerprint.py), run FailureDoctor with memory ON and with memory OFF, and
+For each record in data/generated/incidents.jsonl with day >= 15: build the Incident (use
+services/demo_data.to_incident), run FailureDoctor with memory ON and with memory OFF, and
 compare the verdict to truth.verdict. Print a table: scenario | accuracy OFF |
 accuracy ON | avg confidence | avg latency, and save raw results to
 data/generated/eval_results.jsonl so Jay can inspect misses. Add --scenario and --limit

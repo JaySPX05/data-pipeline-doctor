@@ -1,7 +1,7 @@
 """Measure recall quality: does recall_for_incident() bring back the RIGHT past memories?  Owner: P2.
 
 Prerequisites:
-    python scripts/generate_history.py          # data/generated/history.jsonl
+    python scripts/generate_history.py          # data/generated/incidents.jsonl
     python scripts/seed_memory.py --until-day 14  # bank holds days 1-14
 
 Run from backend/:
@@ -29,6 +29,7 @@ from datetime import datetime
 
 from app.config import ROOT_DIR, settings
 from app.memory.hindsight_store import MemoryStore
+from app.services import demo_data
 from app.models.schemas import Evidence, Incident
 from app.services.fingerprint import fingerprint
 
@@ -93,11 +94,10 @@ def is_hit(ev: Evidence, fp: str, truth_words: set[str]) -> bool:
 
 
 def load_events(from_day: int, scenario: str | None, limit: int | None) -> list[dict]:
-    path = GENERATED / "history.jsonl"
-    if not path.exists():
-        raise SystemExit("No data/generated/history.jsonl. Run scripts/generate_history.py first.")
-    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    rows = [r for r in rows if r["day"] >= from_day and (not scenario or r["scenario_id"] == scenario)]
+    try:
+        rows = demo_data.load_records(from_day=from_day, scenario=scenario)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc))
     if limit:
         per: dict[str, int] = defaultdict(int)
         kept = []
@@ -110,14 +110,8 @@ def load_events(from_day: int, scenario: str | None, limit: int | None) -> list[
 
 
 def to_incident(i: int, row: dict) -> Incident:
-    ev = row["event"]
-    fp, err_cls, err_msg = fingerprint(ev["task_id"], ev["log_tail"])
-    return Incident(
-        id=f"eval_{i:03d}", dag_id=ev["dag_id"], task_id=ev["task_id"], run_id=ev["run_id"],
-        try_number=ev["try_number"], occurred_at=datetime.fromisoformat(ev["occurred_at"]),
-        error_class=err_cls, error_message=err_msg, fingerprint=fp, log_tail=ev["log_tail"],
-        recent_changes=ev.get("recent_changes") or [],
-    )
+    # Shared loader: reads P3's flat incidents.jsonl (and the older nested layout).
+    return demo_data.to_incident(row, f"eval_{i:03d}")
 
 
 # ------------------------------------------------------------------ main

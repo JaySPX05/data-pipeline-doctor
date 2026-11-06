@@ -3,7 +3,7 @@
     cd backend
     python -m app.agent --all                      # one failure per scenario (day >= 15), memory on
     python -m app.agent --all --no-memory          # the "before" picture
-    python -m app.agent --scenario vendor_schema_change --day 19
+    python -m app.agent --scenario S01 --day 19
     python -m app.agent --log path/to/task.log --dag orders_etl --task load_orders
     python -m app.agent --all --json > run.json    # full diagnosis + trace for each
 
@@ -24,19 +24,14 @@ from app.config import settings
 from app.db.database import SessionLocal, init_db
 from app.memory.hindsight_store import MemoryStore
 from app.models.schemas import Incident
+from app.services import demo_data
 from app.services.fingerprint import fingerprint
 
 GREEN, RED, DIM, BOLD, RESET = "\033[32m", "\033[31m", "\033[2m", "\033[1m", "\033[0m"
 
 
-def load_history() -> list[dict]:
-    path = Path(settings.data_dir) / "generated" / "history.jsonl"
-    if not path.exists():
-        sys.exit(f"{path} not found. Run: python scripts/generate_history.py (from the repo root)")
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-
-
 def to_incident(event: dict) -> Incident:
+    """A raw event (used by --log) -> in-memory Incident."""
     fp, error_class, message = fingerprint(event["task_id"], event["log_tail"])
     return Incident(
         id=f"cli_{uuid.uuid4().hex[:8]}",
@@ -63,22 +58,25 @@ def pick_cases(args) -> list[tuple[Incident, dict | None, str]]:
         }
         return [(to_incident(event), None, Path(args.log).name)]
 
-    history = load_history()
+    try:
+        records = demo_data.load_records()
+    except FileNotFoundError as exc:
+        sys.exit(str(exc))
     if args.scenario:
-        items = [h for h in history if h["scenario_id"] == args.scenario]
+        items = demo_data.load_records(scenario=args.scenario)
         if not items:
-            sys.exit(f"No scenario '{args.scenario}'. Known: {sorted({h['scenario_id'] for h in history})}")
+            known = sorted({f"{r['scenario_id']} ({r.get('scenario_name', '')})" for r in records})
+            sys.exit(f"No scenario '{args.scenario}'. Known: {', '.join(known)}")
         if args.day:
-            items = [h for h in items if h["day"] == args.day] or sys.exit(f"No failure on day {args.day}")
+            items = [r for r in items if r["day"] == args.day] or sys.exit(f"No failure on day {args.day}")
         else:
-            items = [next((h for h in items if h["day"] >= args.min_day), items[-1])]
+            items = [next((r for r in items if r["day"] >= args.min_day), items[-1])]
     else:  # --all: first failure on/after --min-day for every scenario
-        seen, items = set(), []
-        for h in history:
-            if h["day"] >= args.min_day and h["scenario_id"] not in seen:
-                seen.add(h["scenario_id"])
-                items.append(h)
-    return [(to_incident(h["event"]), h["truth"], f"{h['scenario_id']} (day {h['day']})") for h in items]
+        items = demo_data.first_per_scenario([r for r in records if r["day"] >= args.min_day])
+    return [
+        (demo_data.to_incident(r, f"cli_{uuid.uuid4().hex[:8]}"), demo_data.truth(r), demo_data.label(r))
+        for r in items
+    ]
 
 
 def print_case(label: str, incident: Incident, diagnosis, trace, truth: dict | None) -> None:
@@ -106,8 +104,8 @@ def print_case(label: str, incident: Incident, diagnosis, trace, truth: dict | N
 def main() -> None:
     ap = argparse.ArgumentParser(prog="python -m app.agent", description="Run the Pipeline Failure Doctor agent")
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--all", action="store_true", help="one failure per scenario from history.jsonl")
-    src.add_argument("--scenario", help="scenario id from data/scenarios")
+    src.add_argument("--all", action="store_true", help="one failure per scenario from data/generated/incidents.jsonl")
+    src.add_argument("--scenario", help="scenario id (S01) or name (vendor_schema_change)")
     src.add_argument("--log", help="path to a raw task log file")
     ap.add_argument("--day", type=int, help="with --scenario: the failure on this day")
     ap.add_argument("--min-day", type=int, default=15, help="skip days the memory was seeded with (default 15)")
