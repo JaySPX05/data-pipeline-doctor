@@ -9,7 +9,7 @@ venv/
 .pytest_cache/
 
 # data
-data/generated/
+
 data/*.sqlite3
 
 # node
