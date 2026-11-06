@@ -77,7 +77,9 @@ def make_store(fake: FakeClient | None = None, clock: Clock | None = None, **kw)
     fake = fake or FakeClient()
     clock = clock or Clock()
     cfg = Settings(memory_enabled=True, hindsight_url="http://fake:8888", hindsight_api_key="", hindsight_bank_id="test-bank")
-    kw.setdefault("brief_cache_path", Path(tempfile.mkdtemp()) / "brief.json")  # never touch data/generated
+    tmp = Path(tempfile.mkdtemp())
+    kw.setdefault("brief_cache_path", tmp / "brief.json")  # never touch data/generated
+    kw.setdefault("outbox_path", tmp / "outbox.jsonl")
     store = MemoryStore(cfg, client_factory=lambda timeout: fake, clock=clock, **kw)
     return store, fake, clock
 
@@ -227,7 +229,9 @@ def test_bank_created_with_new_mission_fields_and_retried_after_failure():
 
     fake.create_bank_error = None
     store.retain_failure(incident())
-    assert store._bank_ready and fake.count("retain") == 1
+    # the first memory was queued (not lost) and is resent before the second one
+    assert store._bank_ready and fake.count("retain") == 2
+    assert store.status()["outbox_pending"] == 0
     kw = [k for n, k in fake.calls if n == "create_bank"][-1]
     assert "reflect_mission" in kw and "retain_mission" in kw and "mission" not in kw
 
@@ -330,3 +334,78 @@ def test_memory_off_reflect_says_so(tmp_path):
     path.write_text(json.dumps({"text": "old brief", "generated_at": "x"}))
     store = MemoryStore(cfg, brief_cache_path=path)
     assert "switched off" in store.reflect()
+
+
+# ---------------------------------------------------------------- retry queue (outbox)
+def test_failed_retain_is_queued_and_resent_first():
+    store, fake, clock = make_store()
+    fake.retain = lambda **kw: (_ for _ in ()).throw(ConnectionError("down"))
+    store.retain_feedback(incident(), Feedback(correct=False, root_cause="vendor rename", fix="map cust_id"))
+    assert store.status()["outbox_pending"] == 1          # kept, not lost
+
+    clock.t += 31                                          # breaker closed again, Hindsight back
+    sent = []
+    fake.retain = lambda **kw: sent.append(kw["document_id"])
+    store.retain_failure(incident(id="inc_2"))
+    assert sent == ["inc_1-correction", "inc_2"]          # queued one first, then the new one
+    assert store.status()["outbox_pending"] == 0
+
+
+def test_queue_survives_a_restart(tmp_path):
+    path = tmp_path / "outbox.jsonl"
+    store, fake, _ = make_store(outbox_path=path)
+    fake.retain = lambda **kw: (_ for _ in ()).throw(ConnectionError("down"))
+    store.retain_failure(incident())
+
+    store2, fake2, _ = make_store(outbox_path=path)        # new process, same file
+    assert store2.status()["outbox_pending"] == 1
+    assert store2.flush_outbox() == 1 and fake2.count("retain") == 1
+    assert not path.exists()
+
+
+def test_resent_feedback_clears_the_recall_cache():
+    store, fake, clock = make_store(FakeClient(lambda kw: SimpleNamespace(results=[result("m")])))
+    store.recall_for_incident(incident())                  # cached
+    fake.retain = lambda **kw: (_ for _ in ()).throw(TimeoutError())
+    store.retain_feedback(incident(), Feedback(correct=False, root_cause="x", fix="y"))
+    clock.t += 31
+    fake.retain = lambda **kw: None
+    recalls = fake.count("recall")
+    store.recall_for_incident(incident())                  # re-cached before the correction is in
+    assert store.flush_outbox() == 1
+    store.recall_for_incident(incident())
+    assert fake.count("recall") > recalls + 3              # cache was cleared after the resend
+
+
+def test_poison_item_is_dropped_after_max_attempts():
+    from hindsight_client_api.exceptions import BadRequestException
+
+    store, fake, _ = make_store()
+    fake.retain = lambda **kw: (_ for _ in ()).throw(BadRequestException(status=400, reason="bad"))
+    store.retain_failure(incident())                       # queued (attempts 0)
+    for _ in range(5):
+        store.flush_outbox()
+    assert store.status()["outbox_pending"] == 0           # gave up instead of blocking the queue
+
+
+def test_memory_off_queues_nothing(tmp_path):
+    cfg = Settings(memory_enabled=False, hindsight_url="http://fake", hindsight_bank_id="b")
+    store = MemoryStore(cfg, outbox_path=tmp_path / "o.jsonl", brief_cache_path=tmp_path / "b.json")
+    store.retain_failure(incident())
+    assert not (tmp_path / "o.jsonl").exists()
+
+
+# ---------------------------------------------------------------- own observations
+def test_rediagnose_skips_observations_of_its_own_fingerprint():
+    from app.models.schemas import Diagnosis, Verdict
+
+    obs = result("summary of this incident's own correction", doc=None, tags=["fp:fp_abc", "kind:correction"])
+    other = result("resolution from an earlier incident", doc="inc_0-resolution", tags=["fp:fp_abc"])
+    store, _, _ = make_store(FakeClient(lambda kw: SimpleNamespace(results=[obs, other])))
+
+    fresh = incident()                                     # first diagnosis: keep everything
+    assert [e.text for e in store.recall_for_incident(fresh)] == [obs.text, other.text]
+
+    again = incident()
+    again.diagnosis = Diagnosis(verdict=Verdict.NEW, root_cause="?", suggested_fix="?", confidence=0.3)
+    assert [e.text for e in store.recall_for_incident(again)] == [other.text]

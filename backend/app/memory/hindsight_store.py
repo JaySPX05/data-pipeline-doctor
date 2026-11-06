@@ -23,6 +23,9 @@ Demo-safety rules (Day 2/3):
   tier it often hits the token limit), the saved brief is returned with a "cached" note.
   Reflect has its own 60 s client and never opens the breaker, so a slow brief can't
   switch off recall for diagnoses.
+- Retry queue ("outbox"): a retain that fails (Hindsight down, LLM quota used up) is written to
+  data/generated/memory_outbox_<bank>.jsonl instead of being lost, and resent, oldest first,
+  before later retains. An engineer's correction is therefore never silently dropped.
 """
 from __future__ import annotations
 
@@ -75,6 +78,10 @@ REFLECT_TIMEOUT_S = 60.0    # reflect makes several LLM calls; never opens the b
 RECALL_BUDGET_S = 5.0       # all recall queries for one incident together
 BREAKER_COOLDOWN_S = 30.0   # how long to skip Hindsight after it timed out or refused a connection
 CACHE_TTL_S = 60.0          # recall cache lifetime
+OUTBOX_FLUSH_BATCH = 5      # queued retains resent before each new retain
+OUTBOX_MAX_ATTEMPTS = 5     # a queued retain rejected this many times is dropped (logged)
+
+_FAILED = object()          # sentinel: _call() could not complete
 
 
 def tags_for(dag_id: str, task_id: str, fingerprint: str | None = None, kind: str | None = None) -> list[str]:
@@ -120,6 +127,7 @@ class MemoryStore:
         cache_ttl_s: float = CACHE_TTL_S,
         reflect_timeout_s: float = REFLECT_TIMEOUT_S,
         brief_cache_path: Path | None = None,
+        outbox_path: Path | None = None,
         client_factory: Callable[[float], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -145,6 +153,10 @@ class MemoryStore:
         self._cache: dict[tuple, tuple[float, list[Evidence]]] = {}
         self.last_error: str | None = None
         self.failed_calls = 0  # every failed call since startup (seed_memory can check this)
+        self.outbox_path = outbox_path or (
+            Path(cfg.data_dir) / "generated" / f"memory_outbox_{self.bank_id}.jsonl"
+        )
+        self._outbox_lock = threading.Lock()
 
     # ------------------------------------------------------------------ plumbing
     def _default_client(self, timeout: float):
@@ -230,6 +242,7 @@ class MemoryStore:
             "breaker_open_for_s": round(breaker_s, 1),
             "cached_recalls": len(self._cache),
             "health_brief_cached_at": (self._load_brief() or {}).get("generated_at"),
+            "outbox_pending": len(self._read_outbox()),
         }
 
     # ------------------------------------------------------------------ cache
@@ -254,6 +267,80 @@ class MemoryStore:
             for key in [k for k in self._cache if k[0] == fingerprint]:
                 del self._cache[key]
 
+    # ------------------------------------------------------------------ outbox (retry queue)
+    def _read_outbox(self) -> list[dict]:
+        try:
+            lines = self.outbox_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        items = []
+        for line in lines:
+            try:
+                items.append(json.loads(line))
+            except ValueError:
+                log.warning("skipping unreadable outbox line")
+        return items
+
+    def _write_outbox(self, items: list[dict]) -> None:
+        try:
+            if not items:
+                self.outbox_path.unlink(missing_ok=True)
+                return
+            self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.outbox_path.with_suffix(".tmp")
+            tmp.write_text("".join(json.dumps(i) + "\n" for i in items), encoding="utf-8")
+            tmp.replace(self.outbox_path)
+        except OSError as exc:
+            log.error("could not write memory outbox %s: %s", self.outbox_path, exc)
+
+    @staticmethod
+    def _jsonable(kwargs: dict) -> dict:
+        out = dict(kwargs)
+        if isinstance(out.get("timestamp"), datetime):
+            out["timestamp"] = out["timestamp"].isoformat()
+        return out
+
+    def flush_outbox(self, max_items: int | None = None) -> int:
+        """Resend queued retains, oldest first. Stops at the first failure. Returns how many were sent."""
+        if not self.enabled or not self.available:
+            return 0
+        with self._outbox_lock:
+            items = self._read_outbox()
+            if not items:
+                return 0
+            sent, remaining = 0, list(items)
+            for item in items[: max_items or len(items)]:
+                if self._call("retain", _FAILED, **item["kwargs"]) is _FAILED:
+                    item["attempts"] = item.get("attempts", 0) + 1
+                    if item["attempts"] >= OUTBOX_MAX_ATTEMPTS:
+                        log.error("dropping memory %s after %d failed attempts: %s",
+                                  item["kwargs"].get("document_id"), item["attempts"], self.last_error)
+                        remaining.remove(item)
+                    break
+                remaining.remove(item)
+                sent += 1
+                if item.get("invalidate_fp"):
+                    self._invalidate_fingerprint(item["invalidate_fp"])
+            self._write_outbox(remaining)
+        if sent:
+            log.info("memory outbox: resent %d queued retain(s), %d still waiting", sent, len(remaining))
+        return sent
+
+    def _retain(self, invalidate_fp: str | None = None, **kwargs) -> bool:
+        """retain with a safety net: on failure the memory is queued in the outbox, not lost."""
+        if not self.enabled:
+            return False
+        self.flush_outbox(max_items=OUTBOX_FLUSH_BATCH)
+        if self._call("retain", _FAILED, **kwargs) is not _FAILED:
+            return True
+        with self._outbox_lock:
+            items = self._read_outbox()
+            items.append({"kwargs": self._jsonable(kwargs), "invalidate_fp": invalidate_fp,
+                          "queued_at": datetime.now(timezone.utc).isoformat(), "attempts": 0})
+            self._write_outbox(items)
+        log.warning("memory %s queued for retry (%s)", kwargs.get("document_id"), self.last_error)
+        return False
+
     # ------------------------------------------------------------------ retain
     def retain_failure(self, incident: Incident) -> None:
         # The agent's own verdict is deliberately NOT stored here: an unconfirmed guess in memory
@@ -264,9 +351,7 @@ class MemoryStore:
             f"(try {incident.try_number}) with {incident.error_class}: {incident.error_message[:300]}. "
             f"Fingerprint {incident.fingerprint}.{changes}"
         )
-        self._call(
-            "retain",
-            None,
+        self._retain(
             content=content,
             context="pipeline failure event",
             timestamp=incident.occurred_at,
@@ -294,9 +379,8 @@ class MemoryStore:
                 f"the agent guessed '{guess}', but the real root cause was {feedback.root_cause}. "
                 f"Correct fix: {feedback.fix}.{took}{verdict_txt}"
             )
-        self._call(
-            "retain",
-            None,
+        self._retain(
+            invalidate_fp=incident.fingerprint,
             content=content,
             context=context,
             timestamp=resolved_at or incident.occurred_at,
@@ -309,9 +393,7 @@ class MemoryStore:
 
     def retain_change(self, change: dict) -> None:
         """An upstream schema change / deploy / vendor release from the change feed."""
-        self._call(
-            "retain",
-            None,
+        self._retain(
             content=change["text"],
             context=f"upstream change: {change.get('type', 'change')}",
             timestamp=change.get("at"),
@@ -366,7 +448,9 @@ class MemoryStore:
         """Evidence for one incident: 3 scoped queries, merged and de-duplicated.
 
         Never returns memories that came from this incident itself (its failure event or
-        its own feedback), so the memory-ON result is never self-confirming.
+        its own feedback), so the memory-ON result is never self-confirming. Hindsight's
+        consolidated "observations" carry no document_id, so for an incident that was already
+        processed once (a rediagnose) observations tagged with its own fingerprint are left out too.
         """
         key = (incident.fingerprint, incident.dag_id, incident.task_id)
         merged = self._cache_get(key)
@@ -374,11 +458,16 @@ class MemoryStore:
             merged, complete = self._recall_uncached(incident)
             if complete:
                 self._cache_put(key, merged)
-        own = (incident.id, f"{incident.id}-")
-        return [
-            ev for ev in merged
-            if not (ev.document_id and (ev.document_id == own[0] or ev.document_id.startswith(own[1])))
-        ][:limit]
+        processed_before = incident.diagnosis is not None or incident.feedback is not None
+        own_fp_tag = f"fp:{incident.fingerprint}"
+
+        def is_own(ev: Evidence) -> bool:
+            doc = ev.document_id
+            if doc:
+                return doc == incident.id or doc.startswith(f"{incident.id}-")
+            return processed_before and own_fp_tag in ev.tags
+
+        return [ev for ev in merged if not is_own(ev)][:limit]
 
     def _recall_uncached(self, incident: Incident) -> tuple[list[Evidence], bool]:
         started = self._clock()
