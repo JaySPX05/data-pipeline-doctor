@@ -1,6 +1,9 @@
 # secrets
 .env
 
+# per-machine compose settings (see docker-compose.override.example.yml)
+docker-compose.override.yml
+
 # python
 __pycache__/
 *.pyc

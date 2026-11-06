@@ -20,7 +20,7 @@ incidents stored in Hindsight memory (retain / recall / reflect), and it gets be
 every time an engineer confirms or corrects a diagnosis.
 
 Stack: Python 3.11 + FastAPI + SQLite (backend/), Hindsight via hindsight-client 1.2,
-Groq via the OpenAI SDK (openai/gpt-oss-120b, fallback openai/gpt-oss-20b),
+Groq via the OpenAI SDK (openai/gpt-oss-120b; fallbacks Gemini via its OpenAI-compatible API when GEMINI_API_KEY is set, then openai/gpt-oss-20b),
 React + Vite + Tailwind v4 + Recharts (frontend/). Demo data is a fictional company,
 QuickBasket, with 6 DAGs and 30 days of failures generated from data/scenarios/*.yaml.
 

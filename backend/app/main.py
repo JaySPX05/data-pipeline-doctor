@@ -29,6 +29,7 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Total-Count", "Server-Timing"],
 )
 
 for router in (failures.router, incidents.router, memory.router, metrics.router):
@@ -40,6 +41,6 @@ def health() -> dict:
     llm = get_llm()
     return {
         "status": "ok",
-        "llm": {"available": llm.available, "model": settings.llm_model, "fallback": settings.llm_fallback_model},
+        "llm": {"available": llm.available, "chain": llm.describe()},
         "memory": get_store().status(),
     }
