@@ -439,3 +439,98 @@ def test_rediagnose_skips_observations_of_its_own_fingerprint():
     again = incident()
     again.diagnosis = Diagnosis(verdict=Verdict.NEW, root_cause="?", suggested_fix="?", confidence=0.3)
     assert [e.text for e in store.recall_for_incident(again)] == [other.text]
+
+
+# ---------------------------------------------------------------- retry queue: temporary vs permanent failures
+def quota_error():
+    """What Hindsight returns when its LLM quota is used up (seen on the real server)."""
+    from hindsight_client_api.exceptions import ServiceException
+
+    return ServiceException(status=500, reason="Fact extraction deferred by provider quota")
+
+
+def test_long_quota_outage_never_drops_the_correction():
+    """Review repro: correction queued, 5 more failures arrive during the outage, then quota returns."""
+    store, fake, _ = make_store()
+    quota_out, delivered = [True], []
+
+    def retain(**kw):
+        if quota_out[0]:
+            raise quota_error()
+        delivered.append(kw["document_id"])
+
+    fake.retain = retain
+    store.retain_feedback(incident(), Feedback(correct=False, root_cause="vendor rename", fix="map cust_id"))
+    for n in range(2, 7):                                  # 5 failures while the quota is still out
+        store.retain_failure(incident(id=f"inc_{n}"))
+
+    queued = store._read_outbox()
+    assert [i["kwargs"]["document_id"] for i in queued] == ["inc_1-correction"] + [f"inc_{n}" for n in range(2, 7)]
+    assert queued[0]["attempts"] == 0                      # quota errors are not the item's fault
+
+    quota_out[0] = False                                   # quota is back
+    store.retain_failure(incident(id="inc_7"))
+    assert delivered[0] == "inc_1-correction"              # the correction goes first
+    store.flush_outbox()
+    assert sorted(delivered) == sorted(["inc_1-correction"] + [f"inc_{n}" for n in range(2, 8)])
+    assert store.status()["outbox_pending"] == 0
+
+
+def test_rate_limit_429_is_not_counted_as_an_attempt():
+    from hindsight_client_api.exceptions import ApiException
+
+    store, fake, _ = make_store()
+    fake.retain = lambda **kw: (_ for _ in ()).throw(ApiException(status=429, reason="Too Many Requests"))
+    store.retain_failure(incident())
+    for _ in range(20):
+        store.flush_outbox()
+    assert store._read_outbox()[0]["attempts"] == 0
+    assert store.status()["outbox_pending"] == 1
+
+
+def test_permanently_rejected_item_does_not_block_the_queue():
+    from hindsight_client_api.exceptions import BadRequestException
+
+    store, fake, _ = make_store()
+    fake.retain = lambda **kw: (_ for _ in ()).throw(ConnectionError("down"))
+    store.retain_failure(incident(id="inc_bad"))
+    store.retain_failure(incident(id="inc_good"))
+    store._down_until = 0                                  # Hindsight is back
+
+    delivered = []
+
+    def retain(**kw):
+        if kw["document_id"] == "inc_bad":
+            raise BadRequestException(status=400, reason="invalid tags")
+        delivered.append(kw["document_id"])
+
+    fake.retain = retain
+    assert store.flush_outbox() == 1
+    assert delivered == ["inc_good"]                       # the good one got through behind the bad one
+    left = store._read_outbox()
+    assert [i["kwargs"]["document_id"] for i in left] == ["inc_bad"] and left[0]["attempts"] == 1
+
+
+def test_queued_memory_older_than_24_hours_is_dropped():
+    from datetime import timedelta
+
+    now = [datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)]
+    store, fake, _ = make_store(wallclock=lambda: now[0])
+    fake.retain = lambda **kw: (_ for _ in ()).throw(quota_error())
+    store.retain_failure(incident())
+    now[0] += timedelta(hours=23)
+    store.flush_outbox()
+    assert store.status()["outbox_pending"] == 1           # still within 24 h: kept
+    now[0] += timedelta(hours=2)
+    store.flush_outbox()
+    assert store.status()["outbox_pending"] == 0           # 25 h: dropped (logged), so nothing is stuck forever
+
+
+def test_is_permanent_classification():
+    from hindsight_client_api.exceptions import ApiException
+    from app.memory.hindsight_store import is_permanent
+
+    assert is_permanent(ApiException(status=400)) and is_permanent(ApiException(status=422))
+    for temporary in (ApiException(status=429), ApiException(status=408), ApiException(status=500),
+                      ApiException(status=503), TimeoutError(), ConnectionError(), None):
+        assert not is_permanent(temporary)

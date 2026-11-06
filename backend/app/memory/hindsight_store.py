@@ -27,7 +27,9 @@ Demo-safety rules (Day 2/3):
   switch off recall for diagnoses.
 - Retry queue ("outbox"): a retain that fails (Hindsight down, LLM quota used up) is written to
   data/generated/memory_outbox_<bank>.jsonl instead of being lost, and resent, oldest first,
-  before later retains. An engineer's correction is therefore never silently dropped.
+  before later retains. Temporary failures (5xx, 429, timeouts, connection errors) never count
+  against an item; only permanent rejections (other 4xx) do, plus a 24 h age limit. So an
+  engineer's correction survives however long the quota outage lasts (up to 24 h).
 """
 from __future__ import annotations
 
@@ -82,7 +84,8 @@ RECALL_BUDGET_S = 5.0       # all recall queries for one incident together
 BREAKER_COOLDOWN_S = 30.0   # how long to skip Hindsight after it timed out or refused a connection
 CACHE_TTL_S = 60.0          # recall cache lifetime
 OUTBOX_FLUSH_BATCH = 5      # queued retains resent before each new retain
-OUTBOX_MAX_ATTEMPTS = 5     # a queued retain rejected this many times is dropped (logged)
+OUTBOX_MAX_ATTEMPTS = 5     # a queued retain PERMANENTLY rejected (4xx) this many times is dropped
+OUTBOX_MAX_AGE_S = 24 * 3600  # a queued retain older than this is dropped, whatever the reason (logged)
 
 _FAILED = object()          # sentinel: _call() could not complete
 
@@ -94,6 +97,16 @@ def tags_for(dag_id: str, task_id: str, fingerprint: str | None = None, kind: st
     if kind:
         tags.append(f"kind:{kind}")
     return tags
+
+
+def is_permanent(exc: BaseException | None) -> bool:
+    """True if retrying can never help: an HTTP 4xx other than 408 (timeout), 425 or 429 (rate limit).
+
+    Everything else (5xx such as Hindsight's "quota exhausted" 500, 429, timeouts, connection
+    errors, unexpected exceptions) is treated as temporary, so a queued memory is kept.
+    """
+    status = getattr(exc, "status", None)
+    return isinstance(status, int) and 400 <= status < 500 and status not in (408, 425, 429)
 
 
 def is_outage(exc: BaseException) -> bool:
@@ -133,6 +146,7 @@ class MemoryStore:
         outbox_path: Path | None = None,
         client_factory: Callable[[float], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         self.cfg = cfg
         self.bank_id = cfg.hindsight_bank_id
@@ -151,6 +165,8 @@ class MemoryStore:
         self._pool: ThreadPoolExecutor | None = None
         self._client_factory = client_factory or self._default_client
         self._clock = clock
+        self._wallclock = wallclock  # real date/time, for the outbox age limit
+        self.last_exc: BaseException | None = None
         self._local = threading.local()  # per-thread clients, see module docstring
         self._lock = threading.Lock()
         self._bank_ready = False
@@ -212,6 +228,7 @@ class MemoryStore:
             self.last_error = None
             return result
         except Exception as exc:  # network down, timeout, bad request, ...
+            self.last_exc = exc
             self.failed_calls += 1
             self.last_error = f"{type(exc).__name__}: {exc}"
             if is_outage(exc) and not slow_ok:
@@ -305,27 +322,56 @@ class MemoryStore:
             out["timestamp"] = out["timestamp"].isoformat()
         return out
 
+    def _expired(self, item: dict, now: datetime) -> bool:
+        try:
+            queued = datetime.fromisoformat(item["queued_at"])
+        except (KeyError, ValueError):
+            return False
+        return (now - queued).total_seconds() > OUTBOX_MAX_AGE_S
+
     def flush_outbox(self, max_items: int | None = None) -> int:
-        """Resend queued retains, oldest first. Stops at the first failure. Returns how many were sent."""
-        if not self.enabled or not self.available:
+        """Resend queued retains, oldest first. Returns how many were sent.
+
+        - temporary failure (5xx, 429, timeout, Hindsight unreachable): stop, keep everything, count nothing
+        - permanent rejection (other 4xx): count an attempt, keep going so it can't block the rest;
+          dropped after OUTBOX_MAX_ATTEMPTS
+        - anything queued longer than OUTBOX_MAX_AGE_S is dropped
+        """
+        if not self.enabled:
             return 0
         with self._outbox_lock:
             items = self._read_outbox()
             if not items:
                 return 0
-            sent, remaining = 0, list(items)
-            for item in items[: max_items or len(items)]:
-                if self._call("retain", _FAILED, **item["kwargs"]) is _FAILED:
+            now = self._wallclock()
+            budget = max_items or len(items)
+            sent = tried = 0
+            stop = not self.available
+            remaining: list[dict] = []
+            for item in items:
+                doc = item["kwargs"].get("document_id")
+                if self._expired(item, now):
+                    log.error("dropping memory %s: still unsent after %d h", doc, OUTBOX_MAX_AGE_S // 3600)
+                    continue
+                if stop or tried >= budget or not self.available:
+                    remaining.append(item)
+                    continue
+                tried += 1
+                self.last_exc = None
+                if self._call("retain", _FAILED, **item["kwargs"]) is not _FAILED:
+                    sent += 1
+                    if item.get("invalidate_fp"):
+                        self._invalidate_fingerprint(item["invalidate_fp"])
+                    continue
+                if is_permanent(self.last_exc):
                     item["attempts"] = item.get("attempts", 0) + 1
                     if item["attempts"] >= OUTBOX_MAX_ATTEMPTS:
-                        log.error("dropping memory %s after %d failed attempts: %s",
-                                  item["kwargs"].get("document_id"), item["attempts"], self.last_error)
-                        remaining.remove(item)
-                    break
-                remaining.remove(item)
-                sent += 1
-                if item.get("invalidate_fp"):
-                    self._invalidate_fingerprint(item["invalidate_fp"])
+                        log.error("dropping memory %s: rejected %d times (%s)", doc, item["attempts"], self.last_error)
+                        continue
+                    remaining.append(item)  # keep going: one bad item must not block the others
+                    continue
+                remaining.append(item)  # temporary problem: not the item's fault, try again later
+                stop = True
             self._write_outbox(remaining)
         if sent:
             log.info("memory outbox: resent %d queued retain(s), %d still waiting", sent, len(remaining))
@@ -336,12 +382,14 @@ class MemoryStore:
         if not self.enabled:
             return False
         self.flush_outbox(max_items=OUTBOX_FLUSH_BATCH)
+        self.last_exc = None
         if self._call("retain", _FAILED, **kwargs) is not _FAILED:
             return True
         with self._outbox_lock:
             items = self._read_outbox()
             items.append({"kwargs": self._jsonable(kwargs), "invalidate_fp": invalidate_fp,
-                          "queued_at": datetime.now(timezone.utc).isoformat(), "attempts": 0})
+                          "queued_at": self._wallclock().isoformat(),
+                          "attempts": 1 if is_permanent(self.last_exc) else 0})
             self._write_outbox(items)
         log.warning("memory %s queued for retry (%s)", kwargs.get("document_id"), self.last_error)
         return False
@@ -463,6 +511,9 @@ class MemoryStore:
             merged, complete = self._recall_uncached(incident)
             if complete:
                 self._cache_put(key, merged)
+        # Trade-off: on a rediagnose this also drops same-fingerprint observations learned from OTHER
+        # incidents (observations can't be traced to their source cheaply), so rediagnose?memory=true
+        # under-uses memory a little. New failures and loop_check are not affected.
         processed_before = incident.diagnosis is not None or incident.feedback is not None
         own_fp_tag = f"fp:{incident.fingerprint}"
 
@@ -490,6 +541,9 @@ class MemoryStore:
     def _executor(self) -> ThreadPoolExecutor:
         with self._lock:
             if self._pool is None:
+                # 6 threads = 2 diagnoses at once (3 queries each). More concurrent diagnoses queue
+                # behind them and may hit the 5 s recall budget (-> partial evidence, not cached).
+                # Fine for the sequential replay/demo; raise this if the API serves real parallel load.
                 self._pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="hindsight-recall")
             return self._pool
 
