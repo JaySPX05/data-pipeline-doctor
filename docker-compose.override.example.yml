@@ -1,0 +1,29 @@
+# Optional: give Hindsight's own LLM a Gemini fallback (Groq first, Gemini on failure).
+#
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#   # and set GEMINI_API_KEY in .env
+#   docker compose up -d hindsight
+#
+# Docker Compose reads docker-compose.override.yml automatically. The copy is git-ignored, so
+# each person opts in on their own machine. Only copy it if GEMINI_API_KEY is set.
+# Requires Hindsight >= 0.8.4 (multi-LLM failover); the compose file uses :latest.
+#
+# Verify it's live:  docker compose exec hindsight printenv HINDSIGHT_API_LLM_STRATEGY
+# Prove failover:    put a bad HINDSIGHT_API_LLM_API_KEY here, retain one memory, and check
+#                    `docker compose logs hindsight` for a Gemini call. Then restore it.
+#
+# This covers Hindsight only. The diagnosis agent has its own Groq -> Gemini fallback, which
+# turns on when GEMINI_API_KEY is set in .env (backend/app/agent/llm.py).
+
+services:
+  hindsight:
+    environment:
+      HINDSIGHT_API_LLM_PROVIDER: groq                 # main
+      HINDSIGHT_API_LLM_API_KEY: ${GROQ_API_KEY}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_LLM_MODEL:-openai/gpt-oss-20b}
+      HINDSIGHT_API_LLM_GROQ_SERVICE_TIER: on_demand
+      HINDSIGHT_API_LLM_1_PROVIDER: gemini             # fallback
+      HINDSIGHT_API_LLM_1_API_KEY: ${GEMINI_API_KEY}
+      HINDSIGHT_API_LLM_1_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+      HINDSIGHT_API_LLM_MAX_RETRIES: "0"               # fail over straight away instead of retrying Groq
+      HINDSIGHT_API_LLM_STRATEGY: '{"mode": "failover"}'
