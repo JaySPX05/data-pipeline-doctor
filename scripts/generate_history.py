@@ -313,6 +313,10 @@ def main():
         print("Try --no-stack-variation, or fix the template.", file=sys.stderr)
         sys.exit(1)
     C.write_jsonl(a.out / "incidents.jsonl", incidents)
+
+    # Backward compatibility for existing backend readers
+    C.write_jsonl(a.out / "history.jsonl", incidents)
+
     C.write_jsonl(a.out / "change_feed.jsonl", changes)
     (a.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({k: manifest[k] for k in ("total_incidents", "total_changes", "seed_window_incidents",

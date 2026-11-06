@@ -307,41 +307,17 @@ class MemoryStore:
         # The next diagnosis for this fingerprint must see the new resolution/correction.
         self._invalidate_fingerprint(incident.fingerprint)
 
-    
     def retain_change(self, change: dict) -> None:
-        """Retain an upstream change from either supported change-feed format."""
-
-        change_text = change.get("text") or change.get("summary", "")
-        change_time = change.get("at") or change.get("ts")
-
-        affects = (
-            change.get("affects_dags")
-            or change.get("affects")
-            or []
-        )
-
-        # Convert task-level references into DAG and task tags.
-        tags = ["kind:change"]
-
-        for affected in affects:
-            dag, separator, task = affected.partition(".")
-
-            tags.append(f"dag:{dag}")
-
-            if separator and task:
-                tags.append(f"task:{dag}.{task}")
-
+        """An upstream schema change / deploy / vendor release from the change feed."""
         self._call(
             "retain",
             None,
-            content=change_text,
+            content=change["text"],
             context=f"upstream change: {change.get('type', 'change')}",
-            timestamp=change_time,
+            timestamp=change.get("at"),
             document_id=change.get("id"),
-            tags=sorted(set(tags)),
+            tags=["kind:change", *[f"dag:{d}" for d in change.get("affects_dags", [])]],
         )
-
-
 
     # ------------------------------------------------------------------ recall
     def _to_evidence(self, response) -> list[Evidence]:
