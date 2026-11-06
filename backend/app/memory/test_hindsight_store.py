@@ -96,7 +96,8 @@ def incident(id="inc_1", fp="fp_abc") -> Incident:
 def test_recall_queries_are_scoped_with_strict_tags():
     store, fake, _ = make_store(FakeClient(lambda kw: SimpleNamespace(results=[result("m")])))
     store.recall_for_incident(incident())
-    q1, q2, q3 = fake.recalls()
+    by_first_tag = {q["tags"][0]: q for q in fake.recalls()}   # queries run in parallel: order varies
+    q1, q2, q3 = by_first_tag["task:orders_etl.load_orders"], by_first_tag["dag:orders_etl"], by_first_tag["kind:change"]
     assert q1["tags"] == ["task:orders_etl.load_orders", "fp:fp_abc"] and q1["tags_match"] == "any_strict"
     assert q2["tags"] == ["dag:orders_etl"] and q2["tags_match"] == "any_strict"
     assert q3["tags"] == ["kind:change", "dag:orders_etl"] and q3["tags_match"] == "all_strict"
@@ -112,12 +113,13 @@ def test_falls_back_to_untagged_search_when_strict_tags_find_nothing():
     store, fake, _ = make_store(FakeClient(on_recall))
     ev = store.recall_for_incident(incident())
     assert [e.text for e in ev] == ["found by text"]
-    assert "tags" not in fake.recalls()[1]  # the safety-net query right after query 1
+    assert any("tags" not in q for q in fake.recalls())  # the untagged safety-net query ran
 
 
 def test_dedupes_and_keeps_query_order():
-    answers = iter([[result("a"), result("b")], [result("b"), result("c")], [result("d")]])
-    store, _, _ = make_store(FakeClient(lambda kw: SimpleNamespace(results=next(answers))))
+    answers = {"task:orders_etl.load_orders": [result("a"), result("b")],
+               "dag:orders_etl": [result("b"), result("c")], "kind:change": [result("d")]}
+    store, _, _ = make_store(FakeClient(lambda kw: SimpleNamespace(results=answers[kw["tags"][0]])))
     assert [e.text for e in store.recall_for_incident(incident())] == ["a", "b", "c", "d"]
 
 
@@ -131,13 +133,14 @@ def test_never_returns_memories_from_the_incident_itself():
 def test_hindsight_down_returns_no_evidence_and_opens_breaker():
     store, fake, clock = make_store(FakeClient(lambda kw: ConnectionError("refused")))
     assert store.recall_for_incident(incident()) == []
-    assert fake.count("recall") == 1          # breaker stopped queries 2 and 3
+    first = fake.count("recall")
+    assert 1 <= first <= 3                     # the 3 queries go out at once
     assert not store.available
     assert store.status()["breaker_open_for_s"] == 30.0
 
     store.recall_for_incident(incident(fp="fp_other"))
     store.retain_failure(incident())
-    assert fake.count("recall") == 1 and fake.count("retain") == 0  # nothing waits on a dead server
+    assert fake.count("recall") == first and fake.count("retain") == 0  # nothing waits on a dead server
 
     clock.t += 31                              # cooldown over: try again
     fake.on_recall = lambda kw: SimpleNamespace(results=[result("back")])
@@ -170,11 +173,38 @@ def test_slow_hindsight_stops_at_recall_budget():
         return SimpleNamespace(results=[result(f"m{clock.t}")])
 
     store, fake, _ = make_store(FakeClient(slow), clock=clock, recall_budget_s=5.0)
+    store.parallel_recall = False               # sequential mode: the budget is checked between queries
     ev = store.recall_for_incident(incident())
     assert fake.count("recall") == 2            # 3rd query skipped: 6 s > 5 s budget
     assert len(ev) == 2
     store.recall_for_incident(incident())
     assert fake.count("recall") == 4            # incomplete results are not cached
+
+
+def test_parallel_recall_waits_for_the_slowest_query_not_the_sum():
+    def slow(kw):
+        time.sleep(0.3)
+        return SimpleNamespace(results=[result(kw["tags"][0])])
+
+    store, fake, _ = make_store(FakeClient(slow))
+    t0 = time.perf_counter()
+    ev = store.recall_for_incident(incident())
+    took = time.perf_counter() - t0
+    assert fake.count("recall") == 3 and len(ev) == 3
+    assert took < 0.7                           # ~0.3 s in parallel, would be ~0.9 s one after another
+    assert [e.text for e in ev] == ["task:orders_etl.load_orders", "dag:orders_etl", "kind:change"]
+
+
+def test_parallel_recall_stops_at_the_budget_and_does_not_cache():
+    def slow(kw):
+        time.sleep(0.6)
+        return SimpleNamespace(results=[result("late")])
+
+    store, fake, _ = make_store(FakeClient(slow), recall_budget_s=0.2)
+    t0 = time.perf_counter()
+    assert store.recall_for_incident(incident()) == []   # nothing came back within 0.2 s
+    assert time.perf_counter() - t0 < 0.5                 # the diagnosis did not wait for the slow server
+    assert store.status()["cached_recalls"] == 0          # incomplete results are not cached
 
 
 def test_real_client_against_slow_server_times_out_fast():
@@ -241,12 +271,12 @@ def test_one_client_per_thread():
     cfg = Settings(memory_enabled=True, hindsight_url="http://fake", hindsight_bank_id="b")
     store = MemoryStore(cfg, client_factory=lambda timeout: made.append(timeout) or FakeClient())
     store._bank_ready = True
-    ids = []
+    clients = []                                 # keep references: ids of dead objects can be reused
     for _ in range(3):
-        t = threading.Thread(target=lambda: ids.append(id(store.recall_client)))
+        t = threading.Thread(target=lambda: clients.append(store.recall_client))
         t.start()
         t.join()
-    assert len(set(ids)) == 3
+    assert len({id(c) for c in clients}) == 3
     a, b = store.recall_client, store.recall_client
     assert a is b                                # reused within a thread
     assert made.count(5.0) == 4                  # recall clients get the short timeout

@@ -14,6 +14,8 @@ Demo-safety rules (Day 2/3):
   client shared across threads fails on every thread but the first
   ("Timeout context manager should be used inside a task").
 - Recall is on the diagnosis path: short timeout (5 s) and a total budget across queries.
+  The 3 recall queries run in parallel (one client per pool thread), so a diagnosis waits for
+  the slowest query, not the sum (~2.2 s -> ~1 s on Hindsight Cloud).
 - Circuit breaker: after a timeout / connection error, skip Hindsight for 30 s instead of
   making every request wait. HTTP errors (bad request, 5xx) do not open it.
 - 60 s in-process recall cache keyed by fingerprint, cleared when feedback for that
@@ -34,6 +36,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -144,6 +147,8 @@ class MemoryStore:
             Path(cfg.data_dir) / "generated" / f"health_brief_{self.bank_id}.json"
         )
         self.recall_level = "mid"  # Hindsight recall budget: low / mid / high (recall_eval.py compares them)
+        self.parallel_recall = True  # run the 3 recall queries at once (False = one after another)
+        self._pool: ThreadPoolExecutor | None = None
         self._client_factory = client_factory or self._default_client
         self._clock = clock
         self._local = threading.local()  # per-thread clients, see module docstring
@@ -469,32 +474,65 @@ class MemoryStore:
 
         return [ev for ev in merged if not is_own(ev)][:limit]
 
-    def _recall_uncached(self, incident: Incident) -> tuple[list[Evidence], bool]:
-        started = self._clock()
-        when = incident.occurred_at.strftime("%Y-%m-%dT%H:%M:%S")  # recency is relative to the failure
+    def _run_query(self, i: int, query: str, scope: dict, when: str) -> list[Evidence] | None:
+        """One recall query. None means the call failed (so the result is incomplete)."""
+        base = {"query": query, "budget": self.recall_level, "max_tokens": 2048, "query_timestamp": when}
+        resp = self._call("recall", None, fast=True, **base, **scope)
+        if resp is None:
+            return None
+        found = self._to_evidence(resp)
+        if i == 0 and not found and self.available:
+            # Safety net: if tags did not survive Hindsight's fact extraction, the strict
+            # filter returns nothing. The ids are in the text, so search without tags.
+            found = self._to_evidence(self._call("recall", None, fast=True, **base))
+        return found
+
+    def _executor(self) -> ThreadPoolExecutor:
+        with self._lock:
+            if self._pool is None:
+                self._pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="hindsight-recall")
+            return self._pool
+
+    @staticmethod
+    def _merge(results: list[list[Evidence] | None]) -> tuple[list[Evidence], bool]:
+        """Merge per-query results in priority order, de-duplicated. complete=False if any query failed."""
         seen: set[str] = set()
         evidence: list[Evidence] = []
         complete = True
-        for i, (query, scope) in enumerate(self._queries(incident)):
-            if self._clock() - started > self.recall_budget_s or not self.available:
-                complete = False
-                break
-            base = {"query": query, "budget": self.recall_level, "max_tokens": 2048, "query_timestamp": when}
-            resp = self._call("recall", None, fast=True, **base, **scope)
-            if resp is None:
+        for found in results:
+            if found is None:
                 complete = False
                 continue
-            found = self._to_evidence(resp)
-            if i == 0 and not found and self.available:
-                # Safety net: if tags did not survive Hindsight's fact extraction, the strict
-                # filter returns nothing. The ids are in the text, so search without tags.
-                found = self._to_evidence(self._call("recall", None, fast=True, **base))
             for ev in found:
                 k = ev.memory_id or ev.text
                 if k not in seen:
                     seen.add(k)
                     evidence.append(ev)
         return evidence, complete
+
+    def _recall_uncached(self, incident: Incident) -> tuple[list[Evidence], bool]:
+        if not self.available:
+            return [], False
+        when = incident.occurred_at.strftime("%Y-%m-%dT%H:%M:%S")  # recency is relative to the failure
+        queries = self._queries(incident)
+        if not self.parallel_recall:
+            return self._recall_sequential(queries, when)
+        futures = [self._executor().submit(self._run_query, i, q, scope, when) for i, (q, scope) in enumerate(queries)]
+        done, not_done = wait(futures, timeout=self.recall_budget_s)
+        # Late queries keep running in the pool until their own timeout; their results are dropped.
+        results = [f.result() if f in done else None for f in futures]
+        evidence, complete = self._merge(results)
+        return evidence, complete and not not_done
+
+    def _recall_sequential(self, queries: list[tuple[str, dict]], when: str) -> tuple[list[Evidence], bool]:
+        started = self._clock()
+        results: list[list[Evidence] | None] = []
+        for i, (query, scope) in enumerate(queries):
+            if self._clock() - started > self.recall_budget_s or not self.available:
+                results.append(None)
+                break
+            results.append(self._run_query(i, query, scope, when))
+        return self._merge(results)
 
     def search(self, query: str, limit: int = 20) -> list[Evidence]:
         return self._to_evidence(self._call("recall", None, fast=True, query=query, budget="mid"))[:limit]
