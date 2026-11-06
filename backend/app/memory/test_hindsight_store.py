@@ -7,11 +7,13 @@ No real Hindsight needed. Run from backend/:
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -75,6 +77,7 @@ def make_store(fake: FakeClient | None = None, clock: Clock | None = None, **kw)
     fake = fake or FakeClient()
     clock = clock or Clock()
     cfg = Settings(memory_enabled=True, hindsight_url="http://fake:8888", hindsight_api_key="", hindsight_bank_id="test-bank")
+    kw.setdefault("brief_cache_path", Path(tempfile.mkdtemp()) / "brief.json")  # never touch data/generated
     store = MemoryStore(cfg, client_factory=lambda timeout: fake, clock=clock, **kw)
     return store, fake, clock
 
@@ -262,3 +265,68 @@ def test_reflect_uses_health_brief_and_reports_outage():
     store2, fake2, _ = make_store(FakeClient())
     fake2.reflect = lambda **kw: (_ for _ in ()).throw(ConnectionError("down"))
     assert store2.reflect().startswith("Memory unavailable")
+
+
+# ---------------------------------------------------------------- Health Brief fallback
+def failing_reflect(exc):
+    def reflect(**kw):
+        raise exc
+    return reflect
+
+
+def test_health_brief_is_saved_and_served_when_reflect_fails(tmp_path):
+    from hindsight_client_api.exceptions import ServiceException
+
+    store, fake, _ = make_store(brief_cache_path=tmp_path / "brief.json")
+    fake.reflect_text = "## Most failing pipelines\norders_etl.load_orders: 4 failures"
+    assert store.reflect() == fake.reflect_text
+    assert store.status()["health_brief_cached_at"]
+
+    fake.reflect = failing_reflect(ServiceException(status=500, reason="Provider quota exhausted"))
+    out = store.reflect()
+    assert out.startswith("## Most failing pipelines")
+    assert "Cached Health Brief from" in out
+
+
+def test_cached_brief_survives_a_restart(tmp_path):
+    path = tmp_path / "brief.json"
+    store, fake, _ = make_store(brief_cache_path=path)
+    fake.reflect_text = "brief v1"
+    store.reflect()
+
+    store2, fake2, _ = make_store(brief_cache_path=path)  # new process, same file
+    fake2.reflect = failing_reflect(ConnectionError("down"))
+    assert store2.reflect().startswith("brief v1")
+
+
+def test_custom_reflect_question_never_returns_the_cached_brief(tmp_path):
+    store, fake, _ = make_store(brief_cache_path=tmp_path / "brief.json")
+    store.reflect()                                   # caches "brief"
+    fake.reflect = failing_reflect(ConnectionError("down"))
+    assert store.reflect("Which task is flakiest?").startswith("Memory unavailable")
+
+
+def test_slow_reflect_does_not_switch_off_recall():
+    store, fake, _ = make_store(FakeClient(lambda kw: SimpleNamespace(results=[result("m")])))
+    fake.reflect = failing_reflect(TimeoutError())
+    store.reflect()
+    assert store.available                            # breaker still closed
+    assert store.recall_for_incident(incident())      # diagnoses still get memory
+
+
+def test_reflect_uses_its_own_longer_timeout():
+    made = []
+    cfg = Settings(memory_enabled=True, hindsight_url="http://fake", hindsight_bank_id="b")
+    store = MemoryStore(cfg, client_factory=lambda t: made.append(t) or FakeClient(),
+                        brief_cache_path=Path(tempfile.mkdtemp()) / "b.json")
+    store._bank_ready = True
+    store.reflect()
+    assert 60.0 in made
+
+
+def test_memory_off_reflect_says_so(tmp_path):
+    cfg = Settings(memory_enabled=False, hindsight_url="http://fake", hindsight_bank_id="b")
+    path = tmp_path / "brief.json"
+    path.write_text(json.dumps({"text": "old brief", "generated_at": "x"}))
+    store = MemoryStore(cfg, brief_cache_path=path)
+    assert "switched off" in store.reflect()

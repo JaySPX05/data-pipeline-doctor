@@ -18,14 +18,21 @@ Demo-safety rules (Day 2/3):
   making every request wait. HTTP errors (bad request, 5xx) do not open it.
 - 60 s in-process recall cache keyed by fingerprint, cleared when feedback for that
   fingerprint is retained, so a correction is visible on the very next diagnosis.
+- Health Brief fallback: reflect() saves the last good brief to
+  data/generated/health_brief_<bank>.json (git-ignored). If reflect fails (on the Groq free
+  tier it often hits the token limit), the saved brief is returned with a "cached" note.
+  Reflect has its own 60 s client and never opens the breaker, so a slow brief can't
+  switch off recall for diagnoses.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from app.config import Settings, settings as default_settings
@@ -63,7 +70,8 @@ HEALTH_BRIEF_QUERY = (
 
 # Timeouts and limits (seconds). Constructor arguments override them, e.g. in tests.
 RECALL_TIMEOUT_S = 5.0      # one recall request
-WRITE_TIMEOUT_S = 30.0      # retain / reflect / create bank: Hindsight runs an LLM for these
+WRITE_TIMEOUT_S = 30.0      # retain / create bank: Hindsight runs an LLM for retain
+REFLECT_TIMEOUT_S = 60.0    # reflect makes several LLM calls; never opens the breaker
 RECALL_BUDGET_S = 5.0       # all recall queries for one incident together
 BREAKER_COOLDOWN_S = 30.0   # how long to skip Hindsight after it timed out or refused a connection
 CACHE_TTL_S = 60.0          # recall cache lifetime
@@ -110,6 +118,8 @@ class MemoryStore:
         recall_budget_s: float = RECALL_BUDGET_S,
         breaker_cooldown_s: float = BREAKER_COOLDOWN_S,
         cache_ttl_s: float = CACHE_TTL_S,
+        reflect_timeout_s: float = REFLECT_TIMEOUT_S,
+        brief_cache_path: Path | None = None,
         client_factory: Callable[[float], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -121,6 +131,10 @@ class MemoryStore:
         self.recall_budget_s = recall_budget_s
         self.breaker_cooldown_s = breaker_cooldown_s
         self.cache_ttl_s = cache_ttl_s
+        self.reflect_timeout_s = reflect_timeout_s
+        self.brief_cache_path = brief_cache_path or (
+            Path(cfg.data_dir) / "generated" / f"health_brief_{self.bank_id}.json"
+        )
         self.recall_level = "mid"  # Hindsight recall budget: low / mid / high (recall_eval.py compares them)
         self._client_factory = client_factory or self._default_client
         self._clock = clock
@@ -160,25 +174,30 @@ class MemoryStore:
         return self._thread_client("recall_client", self.recall_timeout_s)
 
     @property
+    def reflect_client(self):
+        return self._thread_client("reflect_client", self.reflect_timeout_s)
+
+    @property
     def available(self) -> bool:
         """False while memory is off or the circuit breaker is open."""
         return self.enabled and self._clock() >= self._down_until
 
-    def _call(self, fn_name: str, default: Any, *, fast: bool = False, **kwargs) -> Any:
+    def _call(self, fn_name: str, default: Any, *, fast: bool = False, slow_ok: bool = False, **kwargs) -> Any:
+        """fast: recall client (5 s). slow_ok: reflect client (60 s), and failures never open the breaker."""
         if not self.enabled:
             return default
         if self._clock() < self._down_until:
             return default  # breaker open: Hindsight timed out recently, don't wait on it again
         try:
             self._ensure_bank()
-            client = self.recall_client if fast else self.client
+            client = self.recall_client if fast else (self.reflect_client if slow_ok else self.client)
             result = getattr(client, fn_name)(bank_id=self.bank_id, **kwargs)
             self.last_error = None
             return result
         except Exception as exc:  # network down, timeout, bad request, ...
             self.failed_calls += 1
             self.last_error = f"{type(exc).__name__}: {exc}"
-            if is_outage(exc):
+            if is_outage(exc) and not slow_ok:
                 self._down_until = self._clock() + self.breaker_cooldown_s
                 log.warning(
                     "Hindsight %s failed (%s); skipping memory for %.0f s", fn_name, self.last_error, self.breaker_cooldown_s
@@ -210,6 +229,7 @@ class MemoryStore:
             "failed_calls": self.failed_calls,
             "breaker_open_for_s": round(breaker_s, 1),
             "cached_recalls": len(self._cache),
+            "health_brief_cached_at": (self._load_brief() or {}).get("generated_at"),
         }
 
     # ------------------------------------------------------------------ cache
@@ -392,7 +412,42 @@ class MemoryStore:
 
     # ------------------------------------------------------------------ reflect
     def reflect(self, query: str | None = None) -> str:
-        resp = self._call("reflect", None, query=query or HEALTH_BRIEF_QUERY, budget="mid")
-        if resp is None:
-            return "Memory unavailable: could not reach Hindsight."
-        return resp.text
+        """Pipeline Health Brief (query=None) or a custom question about memory.
+
+        The Health Brief falls back to the last good one when Hindsight can't produce a new one.
+        """
+        if not self.enabled:
+            return "Memory unavailable: memory is switched off (MEMORY_ENABLED=false)."
+        is_brief = query is None
+        resp = self._call("reflect", None, slow_ok=True, query=query or HEALTH_BRIEF_QUERY, budget="mid")
+        text = (getattr(resp, "text", None) or "").strip()
+        if text:
+            if is_brief:
+                self._save_brief(text)
+            return text
+        if is_brief:
+            cached = self._load_brief()
+            if cached:
+                return (
+                    f"{cached['text']}\n\n"
+                    f"_Cached Health Brief from {cached['generated_at']}: memory is busy or unreachable "
+                    f"right now, so this is the last brief Hindsight produced._"
+                )
+        return "Memory unavailable: could not reach Hindsight."
+
+    def _save_brief(self, text: str) -> None:
+        try:
+            self.brief_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {"bank_id": self.bank_id, "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), "text": text}
+            tmp = self.brief_cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            tmp.replace(self.brief_cache_path)
+        except OSError as exc:  # a read-only disk must never break the brief itself
+            log.warning("could not save Health Brief cache: %s", exc)
+
+    def _load_brief(self) -> dict | None:
+        try:
+            data = json.loads(self.brief_cache_path.read_text(encoding="utf-8"))
+            return data if data.get("text") else None
+        except (OSError, ValueError):
+            return None

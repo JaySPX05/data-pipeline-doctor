@@ -3,6 +3,13 @@
 Run from backend/:
     python -m app.memory.smoke           # create throwaway bank, test, delete it
     python -m app.memory.smoke --keep    # keep the bank so you can inspect it in the Hindsight UI
+    python -m app.memory.smoke --async-check   # also test background (async) retain under quota pressure
+    python -m app.memory.smoke --pace 0        # no pause between retains (paid Groq tier / Hindsight Cloud)
+    python -m app.memory.smoke --async-check --skip-reflect   # cheapest run that answers the seeding question
+
+Groq free tier: Hindsight's fact extraction uses ~3.5K tokens per retain and the limit is 8K
+tokens/minute, so retains are paced (--pace, default 30 s) and a "quota exhausted, retry at ..."
+error is waited out (max 5 min) and retried. A full run takes about 3-6 minutes.
 
 What it checks (the assumptions hindsight_store.py relies on):
   1. Hindsight is reachable with the URL/key in .env
@@ -13,6 +20,8 @@ What it checks (the assumptions hindsight_store.py relies on):
   6. tags_match="any" behaviour with untagged memories (info only)
   7. tags_match="all_strict" with task + kind narrows to resolutions of that task
   8. reflect() returns text
+  9. (--async-check) retain_async=True queues work and Hindsight's worker finishes it, even
+     when the burst is bigger than one minute of Groq quota
 
 Exit code: 0 = all checks passed, 1 = a check failed, 2 = could not reach Hindsight.
 Never prints the API key.
@@ -20,6 +29,7 @@ Never prints the API key.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 import uuid
@@ -72,6 +82,8 @@ MEMORIES = [
     ),
 ]
 
+QUOTA_MAX_WAIT_S = 300.0  # longest we wait for Hindsight's "retry at" before giving up
+
 QUERY = "Past failures, root causes and fixes for task orders_etl.load_orders with KeyError customer_id"
 
 results_table: list[tuple[str, str, str]] = []  # (check, PASS/FAIL/INFO, detail)
@@ -81,6 +93,42 @@ def record(check: str, ok: bool | None, detail: str = "") -> None:
     status = "INFO" if ok is None else ("PASS" if ok else "FAIL")
     results_table.append((check, status, detail))
     print(f"   -> {status}: {check}" + (f" ({detail})" if detail else ""))
+
+
+def quota_wait_seconds(exc: BaseException) -> float | None:
+    """Seconds to wait if exc is a provider-quota / rate-limit error, else None."""
+    body = str(getattr(exc, "body", None) or exc)
+    low = body.lower()
+    if not any(k in low for k in ("quota", "rate limit", "rate_limit", "429")):
+        return None
+    m = re.search(r"retry at (\d{4}-\d{2}-\d{2}T[\d:.]+(?:\+00:00|Z)?)", body)
+    if m:
+        at = datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        return max(1.0, (at - datetime.now(timezone.utc)).total_seconds() + 2)
+    m = re.search(r"try again in ([\d.]+)s", body)
+    return float(m.group(1)) + 2 if m else 30.0
+
+
+def with_quota_retry(label: str, fn, tries: int = 3):
+    """Run fn(); if Groq's quota is exhausted, wait until Hindsight says to retry, then retry."""
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            wait = quota_wait_seconds(exc)
+            if wait is None or attempt == tries:
+                raise
+            wait = min(wait, QUOTA_MAX_WAIT_S)
+            print(f"   Groq quota exhausted; waiting {wait:.0f} s, then retrying {label} (attempt {attempt + 1}/{tries})")
+            time.sleep(wait)
+
+
+def short_error(exc: BaseException) -> str:
+    body = str(getattr(exc, "body", None) or "")
+    m = re.search(r'"detail":\s*"([^"]{0,220})', body)
+    return f"{type(exc).__name__}: {m.group(1) if m else str(exc)[:220]}"
 
 
 @contextmanager
@@ -115,9 +163,88 @@ def recall(client, bank_id: str, **kwargs):
     return []
 
 
+ASYNC_FP = "fp:fp_async"
+ASYNC_MEMORIES = [
+    f"Task inventory_sync.dq_checks failed its Great Expectations null check on sku_id (fingerprint fp_async), run {i}. "
+    f"Cause: warehouse sync lag; it passed on retry {i} minutes later. Known flaky, do not page."
+    for i in (1, 2, 3)
+]
+
+
+def async_check(client, bank_id: str, now: datetime, max_wait: float) -> None:
+    """Fire 3 background retains at once (more than one minute of Groq quota) and watch them finish."""
+    from hindsight_client.hindsight_client import _run_async
+
+    ops: dict[str, str | None] = {}
+    with timed("9a. retain_async x3, back to back"):
+        for i, content in enumerate(ASYNC_MEMORIES, 1):
+            doc = f"smoke-async-{i}"
+            try:
+                t0 = time.perf_counter()
+                resp = client.retain(
+                    bank_id=bank_id, content=content, context="smoke test: async retain",
+                    timestamp=now - timedelta(hours=i), document_id=doc,
+                    tags=["dag:inventory_sync", "task:inventory_sync.dq_checks", ASYNC_FP, "kind:resolution"],
+                    retain_async=True,
+                )
+                op = getattr(resp, "operation_id", None) or (getattr(resp, "operation_ids", None) or [None])[0]
+                ops[doc] = op
+                print(f"   {doc}: accepted in {(time.perf_counter() - t0) * 1000:.0f} ms, operation {op}")
+            except Exception as exc:
+                ops[doc] = None
+                print(f"   {doc}: REJECTED {short_error(exc)}")
+    accepted = [d for d, op in ops.items() if op]
+    record("retain_async accepts a burst without failing", len(accepted) == len(ASYNC_MEMORIES),
+           f"{len(accepted)}/{len(ASYNC_MEMORIES)} queued")
+
+    final: dict[str, str] = {}
+    max_retries = 0
+    with timed(f"9b. wait for the worker (up to {max_wait:.0f} s)"):
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline and len(final) < len(accepted):
+            for doc in accepted:
+                if doc in final:
+                    continue
+                try:
+                    st = _run_async(client.operations.get_operation_status(
+                        bank_id=bank_id, operation_id=ops[doc], _request_timeout=30))
+                except Exception as exc:
+                    print(f"   {doc}: status check failed: {short_error(exc)}")
+                    continue
+                retries = getattr(st, "retry_count", 0) or 0
+                max_retries = max(max_retries, retries)
+                status = str(getattr(st, "status", "?"))
+                if status in ("completed", "failed", "cancelled"):
+                    final[doc] = status
+                    err = getattr(st, "error_message", None)
+                    print(f"   {doc}: {status} (retries={retries})" + (f" error={err[:160]}" if err else ""))
+            if len(final) < len(accepted):
+                time.sleep(10)
+        for doc in accepted:
+            if doc not in final:
+                print(f"   {doc}: still not finished after {max_wait:.0f} s")
+    done = [d for d, s in final.items() if s == "completed"]
+    record("Hindsight's worker finishes queued retains", bool(accepted) and len(done) == len(accepted),
+           f"{len(done)}/{len(accepted)} completed, max retries {max_retries}")
+    record("worker retried after a quota error", None,
+           f"yes, up to {max_retries} retries" if max_retries else "no retries were needed")
+
+    with timed("9c. recall the async memories"):
+        found = with_quota_retry("recall", lambda: client.recall(
+            bank_id=bank_id, query="Is inventory_sync.dq_checks flaky?", budget="mid",
+            max_tokens=2048, tags=[ASYNC_FP], tags_match="any_strict")).results or []
+        show(found)
+    docs = {doc_of(r) for r in found}
+    record("async memories are recallable", bool(done) and docs >= set(done), f"found docs: {sorted(docs)}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Hindsight smoke test")
     parser.add_argument("--keep", action="store_true", help="do not delete the throwaway bank")
+    parser.add_argument("--pace", type=float, default=30.0, help="seconds to pause between retains (Groq free tier: 30)")
+    parser.add_argument("--async-check", action="store_true", help="also test retain_async under quota pressure")
+    parser.add_argument("--skip-reflect", action="store_true", help="skip reflect (it needs the most Groq quota)")
+    parser.add_argument("--async-wait", type=float, default=420.0, help="max seconds to wait for async retains")
     args = parser.parse_args()
 
     from hindsight_client import Hindsight
@@ -159,10 +286,13 @@ def main() -> int:
         # 3. retain ----------------------------------------------------------
         now = datetime.now(timezone.utc)
         ok_count = 0
-        for doc_id, content, tags, days_ago in MEMORIES:
+        for n, (doc_id, content, tags, days_ago) in enumerate(MEMORIES):
+            if n and args.pace > 0:
+                print(f"\n   (pausing {args.pace:.0f} s for the Groq tokens-per-minute limit)")
+                time.sleep(args.pace)
             with timed(f"3. retain {doc_id}"):
                 try:
-                    client.retain(
+                    with_quota_retry(doc_id, lambda: client.retain(
                         bank_id=bank_id,
                         content=content,
                         context="smoke test: pipeline incident",
@@ -170,11 +300,11 @@ def main() -> int:
                         document_id=doc_id,
                         metadata={"source": "smoke"},
                         tags=tags,
-                    )
+                    ))
                     ok_count += 1
                     print(f"   ok  tags={tags}")
                 except Exception as exc:
-                    print(f"   FAILED: {type(exc).__name__}: {exc}")
+                    print(f"   FAILED: {short_error(exc)}")
         record("retain accepts all our arguments", ok_count == len(MEMORIES), f"{ok_count}/{len(MEMORIES)} stored")
 
         # 4. recall without tags --------------------------------------------
@@ -212,18 +342,30 @@ def main() -> int:
                f"wrong docs: {wrong}" if wrong else f"{len(both)} results")
 
         # 8. reflect ---------------------------------------------------------
-        with timed("8. reflect"):
-            resp = client.reflect(
-                bank_id=bank_id,
-                query="Which task fails most, why, and how has time to fix changed?",
-                budget="low",
-            )
-            text = (resp.text or "").strip()
-            print("   " + text[:600].replace("\n", "\n   "))
-        record("reflect returns text", bool(text), f"{len(text)} chars")
+        # Own try/except: a reflect failure (usually Groq quota) must not skip the async check.
+        if args.skip_reflect:
+            record("reflect returns text", None, "skipped (--skip-reflect)")
+        else:
+            with timed("8. reflect"):
+                try:
+                    resp = with_quota_retry("reflect", lambda: client.reflect(
+                        bank_id=bank_id,
+                        query="Which task fails most, why, and how has time to fix changed?",
+                        budget="low",
+                    ))
+                    text = (resp.text or "").strip()
+                    print("   " + text[:600].replace("\n", "\n   "))
+                    record("reflect returns text", bool(text), f"{len(text)} chars")
+                except Exception as exc:
+                    print(f"   FAILED: {short_error(exc)}")
+                    record("reflect returns text", False, short_error(exc))
+
+        # 9. async retain under quota pressure ------------------------------
+        if args.async_check:
+            async_check(client, bank_id, now, args.async_wait)
 
     except Exception as exc:
-        record("unexpected error", False, f"{type(exc).__name__}: {exc}")
+        record("unexpected error", False, short_error(exc))
     finally:
         if created and not args.keep:
             with timed("9. delete bank"):
