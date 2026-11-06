@@ -14,6 +14,8 @@ Demo-safety rules (Day 2/3):
   client shared across threads fails on every thread but the first
   ("Timeout context manager should be used inside a task").
 - Recall is on the diagnosis path: short timeout (5 s) and a total budget across queries.
+  The 3 recall queries run in parallel (one client per pool thread), so a diagnosis waits for
+  the slowest query, not the sum (~2.2 s -> ~1 s on Hindsight Cloud).
 - Circuit breaker: after a timeout / connection error, skip Hindsight for 30 s instead of
   making every request wait. HTTP errors (bad request, 5xx) do not open it.
 - 60 s in-process recall cache keyed by fingerprint, cleared when feedback for that
@@ -23,6 +25,11 @@ Demo-safety rules (Day 2/3):
   tier it often hits the token limit), the saved brief is returned with a "cached" note.
   Reflect has its own 60 s client and never opens the breaker, so a slow brief can't
   switch off recall for diagnoses.
+- Retry queue ("outbox"): a retain that fails (Hindsight down, LLM quota used up) is written to
+  data/generated/memory_outbox_<bank>.jsonl instead of being lost, and resent, oldest first,
+  before later retains. Temporary failures (5xx, 429, timeouts, connection errors) never count
+  against an item; only permanent rejections (other 4xx) do, plus a 24 h age limit. So an
+  engineer's correction survives however long the quota outage lasts (up to 24 h).
 """
 from __future__ import annotations
 
@@ -31,6 +38,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -75,6 +83,11 @@ REFLECT_TIMEOUT_S = 60.0    # reflect makes several LLM calls; never opens the b
 RECALL_BUDGET_S = 5.0       # all recall queries for one incident together
 BREAKER_COOLDOWN_S = 30.0   # how long to skip Hindsight after it timed out or refused a connection
 CACHE_TTL_S = 60.0          # recall cache lifetime
+OUTBOX_FLUSH_BATCH = 5      # queued retains resent before each new retain
+OUTBOX_MAX_ATTEMPTS = 5     # a queued retain PERMANENTLY rejected (4xx) this many times is dropped
+OUTBOX_MAX_AGE_S = 24 * 3600  # a queued retain older than this is dropped, whatever the reason (logged)
+
+_FAILED = object()          # sentinel: _call() could not complete
 
 
 def tags_for(dag_id: str, task_id: str, fingerprint: str | None = None, kind: str | None = None) -> list[str]:
@@ -84,6 +97,16 @@ def tags_for(dag_id: str, task_id: str, fingerprint: str | None = None, kind: st
     if kind:
         tags.append(f"kind:{kind}")
     return tags
+
+
+def is_permanent(exc: BaseException | None) -> bool:
+    """True if retrying can never help: an HTTP 4xx other than 408 (timeout), 425 or 429 (rate limit).
+
+    Everything else (5xx such as Hindsight's "quota exhausted" 500, 429, timeouts, connection
+    errors, unexpected exceptions) is treated as temporary, so a queued memory is kept.
+    """
+    status = getattr(exc, "status", None)
+    return isinstance(status, int) and 400 <= status < 500 and status not in (408, 425, 429)
 
 
 def is_outage(exc: BaseException) -> bool:
@@ -120,8 +143,10 @@ class MemoryStore:
         cache_ttl_s: float = CACHE_TTL_S,
         reflect_timeout_s: float = REFLECT_TIMEOUT_S,
         brief_cache_path: Path | None = None,
+        outbox_path: Path | None = None,
         client_factory: Callable[[float], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         self.cfg = cfg
         self.bank_id = cfg.hindsight_bank_id
@@ -136,8 +161,12 @@ class MemoryStore:
             Path(cfg.data_dir) / "generated" / f"health_brief_{self.bank_id}.json"
         )
         self.recall_level = "mid"  # Hindsight recall budget: low / mid / high (recall_eval.py compares them)
+        self.parallel_recall = True  # run the 3 recall queries at once (False = one after another)
+        self._pool: ThreadPoolExecutor | None = None
         self._client_factory = client_factory or self._default_client
         self._clock = clock
+        self._wallclock = wallclock  # real date/time, for the outbox age limit
+        self.last_exc: BaseException | None = None
         self._local = threading.local()  # per-thread clients, see module docstring
         self._lock = threading.Lock()
         self._bank_ready = False
@@ -145,6 +174,10 @@ class MemoryStore:
         self._cache: dict[tuple, tuple[float, list[Evidence]]] = {}
         self.last_error: str | None = None
         self.failed_calls = 0  # every failed call since startup (seed_memory can check this)
+        self.outbox_path = outbox_path or (
+            Path(cfg.data_dir) / "generated" / f"memory_outbox_{self.bank_id}.jsonl"
+        )
+        self._outbox_lock = threading.Lock()
 
     # ------------------------------------------------------------------ plumbing
     def _default_client(self, timeout: float):
@@ -195,6 +228,7 @@ class MemoryStore:
             self.last_error = None
             return result
         except Exception as exc:  # network down, timeout, bad request, ...
+            self.last_exc = exc
             self.failed_calls += 1
             self.last_error = f"{type(exc).__name__}: {exc}"
             if is_outage(exc) and not slow_ok:
@@ -230,6 +264,7 @@ class MemoryStore:
             "breaker_open_for_s": round(breaker_s, 1),
             "cached_recalls": len(self._cache),
             "health_brief_cached_at": (self._load_brief() or {}).get("generated_at"),
+            "outbox_pending": len(self._read_outbox()),
         }
 
     # ------------------------------------------------------------------ cache
@@ -254,6 +289,111 @@ class MemoryStore:
             for key in [k for k in self._cache if k[0] == fingerprint]:
                 del self._cache[key]
 
+    # ------------------------------------------------------------------ outbox (retry queue)
+    def _read_outbox(self) -> list[dict]:
+        try:
+            lines = self.outbox_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        items = []
+        for line in lines:
+            try:
+                items.append(json.loads(line))
+            except ValueError:
+                log.warning("skipping unreadable outbox line")
+        return items
+
+    def _write_outbox(self, items: list[dict]) -> None:
+        try:
+            if not items:
+                self.outbox_path.unlink(missing_ok=True)
+                return
+            self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.outbox_path.with_suffix(".tmp")
+            tmp.write_text("".join(json.dumps(i) + "\n" for i in items), encoding="utf-8")
+            tmp.replace(self.outbox_path)
+        except OSError as exc:
+            log.error("could not write memory outbox %s: %s", self.outbox_path, exc)
+
+    @staticmethod
+    def _jsonable(kwargs: dict) -> dict:
+        out = dict(kwargs)
+        if isinstance(out.get("timestamp"), datetime):
+            out["timestamp"] = out["timestamp"].isoformat()
+        return out
+
+    def _expired(self, item: dict, now: datetime) -> bool:
+        try:
+            queued = datetime.fromisoformat(item["queued_at"])
+        except (KeyError, ValueError):
+            return False
+        return (now - queued).total_seconds() > OUTBOX_MAX_AGE_S
+
+    def flush_outbox(self, max_items: int | None = None) -> int:
+        """Resend queued retains, oldest first. Returns how many were sent.
+
+        - temporary failure (5xx, 429, timeout, Hindsight unreachable): stop, keep everything, count nothing
+        - permanent rejection (other 4xx): count an attempt, keep going so it can't block the rest;
+          dropped after OUTBOX_MAX_ATTEMPTS
+        - anything queued longer than OUTBOX_MAX_AGE_S is dropped
+        """
+        if not self.enabled:
+            return 0
+        with self._outbox_lock:
+            items = self._read_outbox()
+            if not items:
+                return 0
+            now = self._wallclock()
+            budget = max_items or len(items)
+            sent = tried = 0
+            stop = not self.available
+            remaining: list[dict] = []
+            for item in items:
+                doc = item["kwargs"].get("document_id")
+                if self._expired(item, now):
+                    log.error("dropping memory %s: still unsent after %d h", doc, OUTBOX_MAX_AGE_S // 3600)
+                    continue
+                if stop or tried >= budget or not self.available:
+                    remaining.append(item)
+                    continue
+                tried += 1
+                self.last_exc = None
+                if self._call("retain", _FAILED, **item["kwargs"]) is not _FAILED:
+                    sent += 1
+                    if item.get("invalidate_fp"):
+                        self._invalidate_fingerprint(item["invalidate_fp"])
+                    continue
+                if is_permanent(self.last_exc):
+                    item["attempts"] = item.get("attempts", 0) + 1
+                    if item["attempts"] >= OUTBOX_MAX_ATTEMPTS:
+                        log.error("dropping memory %s: rejected %d times (%s)", doc, item["attempts"], self.last_error)
+                        continue
+                    remaining.append(item)  # keep going: one bad item must not block the others
+                    continue
+                remaining.append(item)  # temporary problem: not the item's fault, try again later
+                stop = True
+            self._write_outbox(remaining)
+        if sent:
+            log.info("memory outbox: resent %d queued retain(s), %d still waiting", sent, len(remaining))
+        return sent
+
+    def _retain(self, invalidate_fp: str | None = None, **kwargs) -> bool:
+        """retain with a safety net: on failure the memory is queued in the outbox, not lost."""
+        if not self.enabled:
+            return False
+        self.flush_outbox(max_items=OUTBOX_FLUSH_BATCH)
+        self.last_exc = None
+        if self._call("retain", _FAILED, **kwargs) is not _FAILED:
+            return True
+        with self._outbox_lock:
+            items = self._read_outbox()
+            items.append({"kwargs": self._jsonable(kwargs), "invalidate_fp": invalidate_fp,
+                          "queued_at": self._wallclock().isoformat(),
+                          "attempts": 1 if is_permanent(self.last_exc) else 0})
+            self._write_outbox(items)
+        log.warning("memory %s queued for retry (%s)", kwargs.get("document_id"), self.last_error)
+        return False
+
     # ------------------------------------------------------------------ retain
     def retain_failure(self, incident: Incident) -> None:
         # The agent's own verdict is deliberately NOT stored here: an unconfirmed guess in memory
@@ -264,9 +404,7 @@ class MemoryStore:
             f"(try {incident.try_number}) with {incident.error_class}: {incident.error_message[:300]}. "
             f"Fingerprint {incident.fingerprint}.{changes}"
         )
-        self._call(
-            "retain",
-            None,
+        self._retain(
             content=content,
             context="pipeline failure event",
             timestamp=incident.occurred_at,
@@ -294,9 +432,8 @@ class MemoryStore:
                 f"the agent guessed '{guess}', but the real root cause was {feedback.root_cause}. "
                 f"Correct fix: {feedback.fix}.{took}{verdict_txt}"
             )
-        self._call(
-            "retain",
-            None,
+        self._retain(
+            invalidate_fp=incident.fingerprint,
             content=content,
             context=context,
             timestamp=resolved_at or incident.occurred_at,
@@ -309,9 +446,7 @@ class MemoryStore:
 
     def retain_change(self, change: dict) -> None:
         """An upstream schema change / deploy / vendor release from the change feed."""
-        self._call(
-            "retain",
-            None,
+        self._retain(
             content=change["text"],
             context=f"upstream change: {change.get('type', 'change')}",
             timestamp=change.get("at"),
@@ -366,7 +501,9 @@ class MemoryStore:
         """Evidence for one incident: 3 scoped queries, merged and de-duplicated.
 
         Never returns memories that came from this incident itself (its failure event or
-        its own feedback), so the memory-ON result is never self-confirming.
+        its own feedback), so the memory-ON result is never self-confirming. Hindsight's
+        consolidated "observations" carry no document_id, so for an incident that was already
+        processed once (a rediagnose) observations tagged with its own fingerprint are left out too.
         """
         key = (incident.fingerprint, incident.dag_id, incident.task_id)
         merged = self._cache_get(key)
@@ -374,38 +511,82 @@ class MemoryStore:
             merged, complete = self._recall_uncached(incident)
             if complete:
                 self._cache_put(key, merged)
-        own = (incident.id, f"{incident.id}-")
-        return [
-            ev for ev in merged
-            if not (ev.document_id and (ev.document_id == own[0] or ev.document_id.startswith(own[1])))
-        ][:limit]
+        # Trade-off: on a rediagnose this also drops same-fingerprint observations learned from OTHER
+        # incidents (observations can't be traced to their source cheaply), so rediagnose?memory=true
+        # under-uses memory a little. New failures and loop_check are not affected.
+        processed_before = incident.diagnosis is not None or incident.feedback is not None
+        own_fp_tag = f"fp:{incident.fingerprint}"
 
-    def _recall_uncached(self, incident: Incident) -> tuple[list[Evidence], bool]:
-        started = self._clock()
-        when = incident.occurred_at.strftime("%Y-%m-%dT%H:%M:%S")  # recency is relative to the failure
+        def is_own(ev: Evidence) -> bool:
+            doc = ev.document_id
+            if doc:
+                return doc == incident.id or doc.startswith(f"{incident.id}-")
+            return processed_before and own_fp_tag in ev.tags
+
+        return [ev for ev in merged if not is_own(ev)][:limit]
+
+    def _run_query(self, i: int, query: str, scope: dict, when: str) -> list[Evidence] | None:
+        """One recall query. None means the call failed (so the result is incomplete)."""
+        base = {"query": query, "budget": self.recall_level, "max_tokens": 2048, "query_timestamp": when}
+        resp = self._call("recall", None, fast=True, **base, **scope)
+        if resp is None:
+            return None
+        found = self._to_evidence(resp)
+        if i == 0 and not found and self.available:
+            # Safety net: if tags did not survive Hindsight's fact extraction, the strict
+            # filter returns nothing. The ids are in the text, so search without tags.
+            found = self._to_evidence(self._call("recall", None, fast=True, **base))
+        return found
+
+    def _executor(self) -> ThreadPoolExecutor:
+        with self._lock:
+            if self._pool is None:
+                # 6 threads = 2 diagnoses at once (3 queries each). More concurrent diagnoses queue
+                # behind them and may hit the 5 s recall budget (-> partial evidence, not cached).
+                # Fine for the sequential replay/demo; raise this if the API serves real parallel load.
+                self._pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="hindsight-recall")
+            return self._pool
+
+    @staticmethod
+    def _merge(results: list[list[Evidence] | None]) -> tuple[list[Evidence], bool]:
+        """Merge per-query results in priority order, de-duplicated. complete=False if any query failed."""
         seen: set[str] = set()
         evidence: list[Evidence] = []
         complete = True
-        for i, (query, scope) in enumerate(self._queries(incident)):
-            if self._clock() - started > self.recall_budget_s or not self.available:
-                complete = False
-                break
-            base = {"query": query, "budget": self.recall_level, "max_tokens": 2048, "query_timestamp": when}
-            resp = self._call("recall", None, fast=True, **base, **scope)
-            if resp is None:
+        for found in results:
+            if found is None:
                 complete = False
                 continue
-            found = self._to_evidence(resp)
-            if i == 0 and not found and self.available:
-                # Safety net: if tags did not survive Hindsight's fact extraction, the strict
-                # filter returns nothing. The ids are in the text, so search without tags.
-                found = self._to_evidence(self._call("recall", None, fast=True, **base))
             for ev in found:
                 k = ev.memory_id or ev.text
                 if k not in seen:
                     seen.add(k)
                     evidence.append(ev)
         return evidence, complete
+
+    def _recall_uncached(self, incident: Incident) -> tuple[list[Evidence], bool]:
+        if not self.available:
+            return [], False
+        when = incident.occurred_at.strftime("%Y-%m-%dT%H:%M:%S")  # recency is relative to the failure
+        queries = self._queries(incident)
+        if not self.parallel_recall:
+            return self._recall_sequential(queries, when)
+        futures = [self._executor().submit(self._run_query, i, q, scope, when) for i, (q, scope) in enumerate(queries)]
+        done, not_done = wait(futures, timeout=self.recall_budget_s)
+        # Late queries keep running in the pool until their own timeout; their results are dropped.
+        results = [f.result() if f in done else None for f in futures]
+        evidence, complete = self._merge(results)
+        return evidence, complete and not not_done
+
+    def _recall_sequential(self, queries: list[tuple[str, dict]], when: str) -> tuple[list[Evidence], bool]:
+        started = self._clock()
+        results: list[list[Evidence] | None] = []
+        for i, (query, scope) in enumerate(queries):
+            if self._clock() - started > self.recall_budget_s or not self.available:
+                results.append(None)
+                break
+            results.append(self._run_query(i, query, scope, when))
+        return self._merge(results)
 
     def search(self, query: str, limit: int = 20) -> list[Evidence]:
         return self._to_evidence(self._call("recall", None, fast=True, query=query, budget="mid"))[:limit]

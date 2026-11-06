@@ -62,13 +62,15 @@ class ShortQueryStore(MemoryStore):
 
 
 def make_variants() -> dict[str, MemoryStore]:
-    def build(cls=MemoryStore, level="mid"):
+    def build(cls=MemoryStore, level="mid", parallel=True):
         store = cls(settings, cache_ttl_s=0)  # no cache: every incident is a real recall
         store.recall_level = level
+        store.parallel_recall = parallel
         return store
 
     return {
         "baseline": build(),
+        "sequential": build(parallel=False),  # same queries, one after another (the old behaviour)
         "budget_low": build(level="low"),
         "budget_high": build(level="high"),
         "no_tags": build(UntaggedStore),
@@ -120,6 +122,9 @@ def to_incident(i: int, row: dict) -> Incident:
 
 # ------------------------------------------------------------------ main
 def run(store: MemoryStore, rows: list[dict]) -> list[dict]:
+    # Untimed warm-up: open connections first, so the first variant doesn't pay a cold start.
+    if rows:
+        store.recall_for_incident(to_incident(0, rows[0]))
     out = []
     for i, row in enumerate(rows, 1):
         inc = to_incident(i, row)
@@ -159,7 +164,7 @@ def main() -> int:
     ap.add_argument("--from-day", type=int, default=15)
     ap.add_argument("--scenario", help="only this scenario id, e.g. vendor_schema_change")
     ap.add_argument("--limit", type=int, help="max incidents per scenario (keeps runs short)")
-    ap.add_argument("--variant", choices=["all", "baseline", "budget_low", "budget_high", "no_tags", "short_query"],
+    ap.add_argument("--variant", choices=["all", "baseline", "sequential", "budget_low", "budget_high", "no_tags", "short_query"],
                     default="all")
     args = ap.parse_args()
 
