@@ -6,24 +6,67 @@ Design rules:
 - Every memory carries tags (dag:, task:, fp:, kind:) so recall can be scoped.
 - Identifiers (task, fingerprint, error) are ALSO written into the content text, so
   semantic + keyword recall find them even without tag filters.
-- Every call is wrapped: if Hindsight is down, the agent keeps working without memory.
+- Every call is wrapped: if Hindsight is down or slow, the agent keeps working without memory.
+
+Demo-safety rules (Day 2/3):
+- One Hindsight client PER THREAD. The client's sync methods run an asyncio loop with an
+  aiohttp session bound to that loop; FastAPI runs our sync routes in a thread pool, and a
+  client shared across threads fails on every thread but the first
+  ("Timeout context manager should be used inside a task").
+- Recall is on the diagnosis path: short timeout (5 s) and a total budget across queries.
+- Circuit breaker: after a timeout / connection error, skip Hindsight for 30 s instead of
+  making every request wait. HTTP errors (bad request, 5xx) do not open it.
+- 60 s in-process recall cache keyed by fingerprint, cleared when feedback for that
+  fingerprint is retained, so a correction is visible on the very next diagnosis.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from app.config import Settings, settings as default_settings
 from app.models.schemas import Evidence, Feedback, Incident
 
 log = logging.getLogger(__name__)
 
-BANK_MISSION = (
+REFLECT_MISSION = (
     "You are the on-call memory of QuickBasket's data platform team. Track how data "
     "pipelines fail, why they fail, which failures are flaky, which upstream changes "
-    "break which pipelines, and exactly what fixed each failure and how long it took."
+    "break which pipelines, and exactly what fixed each failure and how long it took. "
+    "When summarising, name tasks as dag.task, give counts, and prefer concrete fixes."
 )
+RETAIN_MISSION = (
+    "Keep: task names (dag.task), fingerprints (fp_...), error classes, root causes, "
+    "fixes, minutes to fix, whether the task passed on retry, and which upstream change, "
+    "deploy or vendor release caused a failure. Keep corrections of earlier wrong diagnoses."
+)
+BANK_MISSION = REFLECT_MISSION  # backward-compatible name
+
+HEALTH_BRIEF_QUERY = (
+    "Write a Pipeline Health Brief for the data platform team, using only what is in memory. "
+    "Use exactly these markdown headings, in this order:\n"
+    "## Most failing pipelines\n"
+    "Up to 5 tasks as dag.task, each with the number of failures, the main error, and the root cause.\n"
+    "## Flaky (do not page)\n"
+    "Tasks whose failures pass on retry, with how often they happened.\n"
+    "## Upstream causes\n"
+    "Which upstream teams, vendors, schema changes or deploys caused breakages, and how many.\n"
+    "## Top 3 permanent fixes\n"
+    "A numbered list. For each fix: what to change, which tasks it protects, and how many "
+    "incidents and engineer-minutes it would have prevented.\n"
+    "Be concrete. If memory does not support a claim, leave it out."
+)
+
+# Timeouts and limits (seconds). Constructor arguments override them, e.g. in tests.
+RECALL_TIMEOUT_S = 5.0      # one recall request
+WRITE_TIMEOUT_S = 30.0      # retain / reflect / create bank: Hindsight runs an LLM for these
+RECALL_BUDGET_S = 5.0       # all recall queries for one incident together
+BREAKER_COOLDOWN_S = 30.0   # how long to skip Hindsight after it timed out or refused a connection
+CACHE_TTL_S = 60.0          # recall cache lifetime
 
 
 def tags_for(dag_id: str, task_id: str, fingerprint: str | None = None, kind: str | None = None) -> list[str]:
@@ -35,62 +78,161 @@ def tags_for(dag_id: str, task_id: str, fingerprint: str | None = None, kind: st
     return tags
 
 
+def is_outage(exc: BaseException) -> bool:
+    """True if the error means Hindsight is unreachable or too slow (open the breaker).
+
+    False for HTTP error responses: the server is up, it just rejected this one request.
+    """
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError)):
+        return True
+    try:
+        import aiohttp
+
+        if isinstance(exc, aiohttp.ClientResponseError):
+            return False
+        if isinstance(exc, aiohttp.ClientError):  # connector / server-disconnected errors
+            return True
+    except ImportError:  # pragma: no cover
+        pass
+    if isinstance(exc, OSError):
+        return True
+    name = type(exc).__name__
+    return "Timeout" in name or "Connect" in name
+
+
 class MemoryStore:
-    def __init__(self, cfg: Settings = default_settings):
+    def __init__(
+        self,
+        cfg: Settings = default_settings,
+        *,
+        recall_timeout_s: float = RECALL_TIMEOUT_S,
+        write_timeout_s: float = WRITE_TIMEOUT_S,
+        recall_budget_s: float = RECALL_BUDGET_S,
+        breaker_cooldown_s: float = BREAKER_COOLDOWN_S,
+        cache_ttl_s: float = CACHE_TTL_S,
+        client_factory: Callable[[float], Any] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self.cfg = cfg
         self.bank_id = cfg.hindsight_bank_id
         self.enabled = cfg.memory_enabled
-        self._client = None
+        self.recall_timeout_s = recall_timeout_s
+        self.write_timeout_s = write_timeout_s
+        self.recall_budget_s = recall_budget_s
+        self.breaker_cooldown_s = breaker_cooldown_s
+        self.cache_ttl_s = cache_ttl_s
+        self.recall_level = "mid"  # Hindsight recall budget: low / mid / high (recall_eval.py compares them)
+        self._client_factory = client_factory or self._default_client
+        self._clock = clock
+        self._local = threading.local()  # per-thread clients, see module docstring
+        self._lock = threading.Lock()
         self._bank_ready = False
+        self._down_until = 0.0
+        self._cache: dict[tuple, tuple[float, list[Evidence]]] = {}
         self.last_error: str | None = None
+        self.failed_calls = 0  # every failed call since startup (seed_memory can check this)
 
     # ------------------------------------------------------------------ plumbing
+    def _default_client(self, timeout: float):
+        from hindsight_client import Hindsight
+
+        return Hindsight(
+            base_url=self.cfg.hindsight_url,
+            api_key=self.cfg.hindsight_api_key or None,
+            timeout=timeout,
+            max_attempts=1,  # never retry on the request path; the breaker handles outages
+        )
+
+    def _thread_client(self, kind: str, timeout: float):
+        client = getattr(self._local, kind, None)
+        if client is None:
+            client = self._client_factory(timeout)
+            setattr(self._local, kind, client)
+        return client
+
     @property
     def client(self):
-        if self._client is None:
-            from hindsight_client import Hindsight
+        """Client for retain / reflect / bank admin (long timeout). Also used by scripts/reset_demo.py."""
+        return self._thread_client("write_client", self.write_timeout_s)
 
-            self._client = Hindsight(
-                base_url=self.cfg.hindsight_url,
-                api_key=self.cfg.hindsight_api_key or None,
-                timeout=30.0,
-                max_attempts=2,
-            )
-        return self._client
+    @property
+    def recall_client(self):
+        return self._thread_client("recall_client", self.recall_timeout_s)
 
-    def _call(self, fn_name: str, default: Any, **kwargs) -> Any:
+    @property
+    def available(self) -> bool:
+        """False while memory is off or the circuit breaker is open."""
+        return self.enabled and self._clock() >= self._down_until
+
+    def _call(self, fn_name: str, default: Any, *, fast: bool = False, **kwargs) -> Any:
         if not self.enabled:
             return default
+        if self._clock() < self._down_until:
+            return default  # breaker open: Hindsight timed out recently, don't wait on it again
         try:
             self._ensure_bank()
-            result = getattr(self.client, fn_name)(bank_id=self.bank_id, **kwargs)
+            client = self.recall_client if fast else self.client
+            result = getattr(client, fn_name)(bank_id=self.bank_id, **kwargs)
             self.last_error = None
             return result
-        except Exception as exc:  # network down, bad config, etc.
+        except Exception as exc:  # network down, timeout, bad request, ...
+            self.failed_calls += 1
             self.last_error = f"{type(exc).__name__}: {exc}"
-            log.warning("Hindsight %s failed: %s", fn_name, self.last_error)
+            if is_outage(exc):
+                self._down_until = self._clock() + self.breaker_cooldown_s
+                log.warning(
+                    "Hindsight %s failed (%s); skipping memory for %.0f s", fn_name, self.last_error, self.breaker_cooldown_s
+                )
+            else:
+                log.warning("Hindsight %s failed: %s", fn_name, self.last_error)
             return default
 
     def _ensure_bank(self) -> None:
         if self._bank_ready:
             return
-        try:
-            self.client.create_bank(
-                bank_id=self.bank_id,
-                name="QuickBasket data platform on-call",
-                mission=BANK_MISSION,
-            )
-        except Exception as exc:  # most likely: bank already exists
-            log.debug("create_bank: %s", exc)
+        # create_bank is "create or update", so it is safe to call when the bank exists.
+        # If it raises, _call() reports the error and we try again on the next call.
+        self.client.create_bank(
+            bank_id=self.bank_id,
+            reflect_mission=REFLECT_MISSION,
+            retain_mission=RETAIN_MISSION,
+        )
         self._bank_ready = True
 
     def status(self) -> dict:
+        breaker_s = max(0.0, self._down_until - self._clock())
         return {
             "enabled": self.enabled,
+            "available": self.available,
             "bank_id": self.bank_id,
             "url": self.cfg.hindsight_url,
             "last_error": self.last_error,
+            "failed_calls": self.failed_calls,
+            "breaker_open_for_s": round(breaker_s, 1),
+            "cached_recalls": len(self._cache),
         }
+
+    # ------------------------------------------------------------------ cache
+    def clear_cache(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+    def _cache_get(self, key: tuple) -> list[Evidence] | None:
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit and self._clock() - hit[0] < self.cache_ttl_s:
+                return hit[1]
+            self._cache.pop(key, None)
+            return None
+
+    def _cache_put(self, key: tuple, evidence: list[Evidence]) -> None:
+        with self._lock:
+            self._cache[key] = (self._clock(), evidence)
+
+    def _invalidate_fingerprint(self, fingerprint: str) -> None:
+        with self._lock:
+            for key in [k for k in self._cache if k[0] == fingerprint]:
+                del self._cache[key]
 
     # ------------------------------------------------------------------ retain
     def retain_failure(self, incident: Incident) -> None:
@@ -142,6 +284,8 @@ class MemoryStore:
             metadata={"dag_id": incident.dag_id, "task_id": incident.task_id, "fingerprint": incident.fingerprint},
             tags=tags_for(incident.dag_id, incident.task_id, incident.fingerprint, kind),
         )
+        # The next diagnosis for this fingerprint must see the new resolution/correction.
+        self._invalidate_fingerprint(incident.fingerprint)
 
     def retain_change(self, change: dict) -> None:
         """An upstream schema change / deploy / vendor release from the change feed."""
@@ -152,7 +296,7 @@ class MemoryStore:
             context=f"upstream change: {change.get('type', 'change')}",
             timestamp=change.get("at"),
             document_id=change.get("id"),
-            tags=[f"kind:change", *[f"dag:{d}" for d in change.get("affects_dags", [])]],
+            tags=["kind:change", *[f"dag:{d}" for d in change.get("affects_dags", [])]],
         )
 
     # ------------------------------------------------------------------ recall
@@ -161,7 +305,9 @@ class MemoryStore:
         for r in getattr(response, "results", None) or []:
             occurred = getattr(r, "occurred_start", None) or getattr(r, "mentioned_at", None)
             try:
-                occurred_dt = datetime.fromisoformat(str(occurred)) if occurred else None
+                occurred_dt = occurred if isinstance(occurred, datetime) else (
+                    datetime.fromisoformat(str(occurred)) if occurred else None
+                )
             except ValueError:
                 occurred_dt = None
             out.append(
@@ -176,46 +322,77 @@ class MemoryStore:
             )
         return out
 
-    def recall_for_incident(self, incident: Incident, limit: int = 8) -> list[Evidence]:
-        """TODO(P2): tune these queries on Day 2/3 with the real scenario data."""
-        queries = [
-            (
-                f"Past failures, root causes and fixes for task {incident.dag_id}.{incident.task_id} "
-                f"with {incident.error_class}: {incident.error_message[:160]}",
-                tags_for(incident.dag_id, incident.task_id, incident.fingerprint),
+    def _queries(self, incident: Incident) -> list[tuple[str, dict]]:
+        """(query, recall kwargs). Order = priority: earlier results are kept first."""
+        dag, task = incident.dag_id, f"{incident.dag_id}.{incident.task_id}"
+        return [
+            (  # 1. this exact failure: same task or same fingerprint
+                f"Past failures, root causes, fixes and corrections for task {task} with "
+                f"{incident.error_class}: {incident.error_message[:160]}. Fingerprint {incident.fingerprint}.",
+                {"tags": [f"task:{task}", f"fp:{incident.fingerprint}"], "tags_match": "any_strict"},
             ),
-            (f"Is {incident.dag_id}.{incident.task_id} known to be flaky or pass on retry?", None),
-            (
-                f"Upstream schema changes, deploys or vendor releases affecting {incident.dag_id} "
+            (  # 2. flakiness in the same DAG
+                f"Is {task} or {incident.error_class} known to be flaky, transient, or to pass on retry?",
+                {"tags": [f"dag:{dag}"], "tags_match": "any_strict"},
+            ),
+            (  # 3. upstream changes that hit this DAG shortly before the failure
+                f"Upstream schema changes, deploys or vendor releases affecting {dag} "
                 f"in the days before {incident.occurred_at:%Y-%m-%d}",
-                None,
+                {"tags": ["kind:change", f"dag:{dag}"], "tags_match": "all_strict"},
             ),
         ]
-        seen, evidence = set(), []
-        for query, tags in queries:
-            kwargs = {"query": query, "budget": "mid", "max_tokens": 2048}
-            if tags:
-                kwargs.update(tags=tags, tags_match="any")
-            for ev in self._to_evidence(self._call("recall", None, **kwargs)):
-                if ev.document_id == incident.id:
-                    continue  # never match the incident against itself
-                key = ev.memory_id or ev.text
-                if key not in seen:
-                    seen.add(key)
+
+    def recall_for_incident(self, incident: Incident, limit: int = 8) -> list[Evidence]:
+        """Evidence for one incident: 3 scoped queries, merged and de-duplicated.
+
+        Never returns memories that came from this incident itself (its failure event or
+        its own feedback), so the memory-ON result is never self-confirming.
+        """
+        key = (incident.fingerprint, incident.dag_id, incident.task_id)
+        merged = self._cache_get(key)
+        if merged is None:
+            merged, complete = self._recall_uncached(incident)
+            if complete:
+                self._cache_put(key, merged)
+        own = (incident.id, f"{incident.id}-")
+        return [
+            ev for ev in merged
+            if not (ev.document_id and (ev.document_id == own[0] or ev.document_id.startswith(own[1])))
+        ][:limit]
+
+    def _recall_uncached(self, incident: Incident) -> tuple[list[Evidence], bool]:
+        started = self._clock()
+        when = incident.occurred_at.strftime("%Y-%m-%dT%H:%M:%S")  # recency is relative to the failure
+        seen: set[str] = set()
+        evidence: list[Evidence] = []
+        complete = True
+        for i, (query, scope) in enumerate(self._queries(incident)):
+            if self._clock() - started > self.recall_budget_s or not self.available:
+                complete = False
+                break
+            base = {"query": query, "budget": self.recall_level, "max_tokens": 2048, "query_timestamp": when}
+            resp = self._call("recall", None, fast=True, **base, **scope)
+            if resp is None:
+                complete = False
+                continue
+            found = self._to_evidence(resp)
+            if i == 0 and not found and self.available:
+                # Safety net: if tags did not survive Hindsight's fact extraction, the strict
+                # filter returns nothing. The ids are in the text, so search without tags.
+                found = self._to_evidence(self._call("recall", None, fast=True, **base))
+            for ev in found:
+                k = ev.memory_id or ev.text
+                if k not in seen:
+                    seen.add(k)
                     evidence.append(ev)
-        return evidence[:limit]
+        return evidence, complete
 
     def search(self, query: str, limit: int = 20) -> list[Evidence]:
-        return self._to_evidence(self._call("recall", None, query=query, budget="mid"))[:limit]
+        return self._to_evidence(self._call("recall", None, fast=True, query=query, budget="mid"))[:limit]
 
     # ------------------------------------------------------------------ reflect
     def reflect(self, query: str | None = None) -> str:
-        query = query or (
-            "Write a Pipeline Health Brief for the data platform team: which pipelines fail most and why, "
-            "which failures are flaky and should not page anyone, which upstream teams or vendors cause the "
-            "most breakages, and the top 3 permanent fixes that would remove repeat incidents."
-        )
-        resp = self._call("reflect", None, query=query, budget="mid")
+        resp = self._call("reflect", None, query=query or HEALTH_BRIEF_QUERY, budget="mid")
         if resp is None:
             return "Memory unavailable: could not reach Hindsight."
         return resp.text
