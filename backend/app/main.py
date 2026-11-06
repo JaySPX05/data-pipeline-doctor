@@ -41,6 +41,6 @@ def health() -> dict:
     llm = get_llm()
     return {
         "status": "ok",
-        "llm": {"available": llm.available, "model": settings.llm_model, "fallback": settings.llm_fallback_model},
+        "llm": {"available": llm.available, "chain": llm.describe()},
         "memory": get_store().status(),
     }
