@@ -5,7 +5,7 @@ from app.agent.doctor import FailureDoctor
 from app.db.database import get_session
 from app.deps import get_doctor, get_store
 from app.memory.hindsight_store import MemoryStore
-from app.models.schemas import Diagnosis, Feedback, Incident
+from app.models.schemas import Diagnosis, Feedback, Incident, IncidentStatus, Verdict
 from app.services import incident_service as svc
 
 router = APIRouter(prefix="/api/incidents", tags=["incidents"])
@@ -21,8 +21,8 @@ def _get_or_404(session: Session, incident_id: str) -> Incident:
 @router.get("", response_model=list[Incident])
 def list_incidents(
     response: Response,
-    status: str | None = Query(None, description="open / diagnosed / resolved"),
-    verdict: str | None = Query(None, description="KNOWN_ISSUE / FLAKY / UPSTREAM_CHANGE / NEW"),
+    status: IncidentStatus | None = Query(None, description="open / diagnosed / resolved"),
+    verdict: Verdict | None = Query(None, description="KNOWN_ISSUE / FLAKY / UPSTREAM_CHANGE / NEW"),
     dag_id: str | None = None,
     q: str | None = Query(None, description="Search task, DAG, error class, error message or fingerprint"),
     limit: int = Query(200, ge=1, le=1000),
@@ -31,7 +31,10 @@ def list_incidents(
 ):
     """Incident inbox, newest first. Total matching count is in the X-Total-Count header."""
     items, total = svc.list_incidents(
-        session, status=status, verdict=verdict, dag_id=dag_id, q=q, limit=limit, offset=offset
+        session,
+        status=status.value if status else None,
+        verdict=verdict.value if verdict else None,
+        dag_id=dag_id, q=q, limit=limit, offset=offset,
     )
     response.headers["X-Total-Count"] = str(total)
     return items

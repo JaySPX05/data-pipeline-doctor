@@ -6,7 +6,7 @@
 - [ ] Architecture diagram present in README
 - [ ] Fresh-clone test in a new folder: `cp .env.example .env` -> add keys -> `make up-cloud` -> `make seed`
 - [ ] CI green on main
-- [ ] Banned-word search clean (CI job `banned-word` passes)
+- [ ] Banned-word search clean (CI job `banned-word` passes; it fails on the word anywhere except the two rule docs)
 
 ## Proof the prototype works
 - [ ] `make e2e` passes against a live stack (memory ON): output saved/pasted in the PR
