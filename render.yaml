@@ -1,0 +1,57 @@
+# Render Blueprint: the API (Docker) + the React UI (static site), both on the free tier.
+# Deploy: Render dashboard -> New -> Blueprint -> pick this repo. It asks for the secrets below.
+#
+# Memory uses a SEPARATE Hindsight bank (quickbasket-demo) so whatever visitors click on the
+# hosted demo never leaks into the bank the eval runs against (quickbasket-data-platform).
+# Seed it once from your machine:  python scripts/seed_memory.py --bank-id quickbasket-demo
+services:
+  - type: web
+    name: pipeline-failure-doctor-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./deploy/backend.Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # --- secrets: Render asks for these when you create the Blueprint ---
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY        # optional fallback on its own quota; leave blank to skip
+        sync: false
+      - key: HINDSIGHT_API_KEY
+        sync: false
+      # --- plain settings ---
+      - key: HINDSIGHT_URL
+        value: https://api.hindsight.vectorize.io
+      - key: HINDSIGHT_BANK_ID
+        value: quickbasket-demo
+      - key: MEMORY_ENABLED
+        value: "true"
+      - key: LLM_FALLBACK_MODEL
+        value: openai/gpt-oss-20b
+      # Free instances have no persistent disk: SQLite starts from this snapshot on every boot.
+      # Until the snapshot exists the inbox simply starts empty (see README "Deploy").
+      - key: DEMO_SNAPSHOT
+        value: data/demo/pfd_demo.sqlite3
+      # Let the hosted UI call the API (Render may add a suffix to the name if it's taken).
+      - key: CORS_ORIGIN_REGEX
+        value: https://pipeline-failure-doctor(-[a-z0-9]+)?\.onrender\.com
+
+  - type: web
+    name: pipeline-failure-doctor
+    runtime: static
+    buildCommand: cd frontend && npm ci && npm run build
+    staticPublishPath: frontend/dist
+    autoDeploy: true
+    routes:
+      - type: rewrite           # React Router: every path serves the app
+        source: /*
+        destination: /index.html
+    envVars:
+      # The browser calls the API directly, so this must be its PUBLIC URL. If Render gave the
+      # API a different hostname (name already taken), change this and redeploy the static site.
+      - key: VITE_API_URL
+        value: https://pipeline-failure-doctor-api.onrender.com
+      - key: VITE_USE_MOCKS
+        value: "false"

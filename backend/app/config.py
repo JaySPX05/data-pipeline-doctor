@@ -37,8 +37,15 @@ class Settings(BaseSettings):
     data_dir: Path = ROOT_DIR / "data"
     database_url: str = f"sqlite:///{ROOT_DIR / 'data' / 'pfd.sqlite3'}"
 
+    # Hosted demo (Render): a SQLite snapshot copied in on boot when the database file doesn't
+    # exist yet. Free hosting has no persistent disk, so without it the inbox is empty after
+    # every restart. Leave empty locally.
+    demo_snapshot: str = ""
+
     # API
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    # Extra allowed origins as a regex, e.g. https://.*\.onrender\.com for the hosted UI.
+    cors_origin_regex: str | None = None
 
 
 settings = Settings()
