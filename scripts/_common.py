@@ -21,6 +21,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Read the repo-root .env like the backend does, so HINDSIGHT_URL / HINDSIGHT_API_KEY (Hindsight
+# Cloud) reach the scripts too. Variables already set in the shell win (override=False).
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env", override=False)
+except ImportError:  # python-dotenv is in backend/requirements.txt; scripts still run without it
+    pass
+
 DATA_DIR = ROOT / "data"
 SCENARIO_DIR = DATA_DIR / "scenarios"
 GEN_DIR = DATA_DIR / "generated"

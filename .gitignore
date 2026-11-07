@@ -19,6 +19,7 @@ data/*.sqlite3
 data/generated/memory_outbox_*
 data/generated/health_brief_*
 data/generated/recall_eval.jsonl
+data/generated/eval_results.jsonl
 
 # node
 node_modules/
