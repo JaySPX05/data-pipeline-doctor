@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { api } from "../api/client.js";
+import { api, USE_MOCKS } from "../api/client.js";
 
 const STATUS_FILTERS = ["All observed", "Active incident", "Resolved incidents"];
+const isCount = (value) => typeof value === "number" && Number.isFinite(value);
 
 function groupByDag(incidents) {
   const groups = new Map();
@@ -15,14 +16,38 @@ function groupByDag(incidents) {
   return Array.from(groups, ([dag_id, records]) => ({
     dag_id,
     incidents: records.sort((a, b) => String(b.occurred_at || "").localeCompare(String(a.occurred_at || ""))),
-    hasActive: records.some((incident) => incident.status !== "resolved"),
   }));
+}
+
+function formatList(value, emptyLabel = "None") {
+  if (Array.isArray(value)) {
+    if (!value.length) return emptyLabel;
+    return value.map((item) => typeof item === "string" ? item : item?.task_id || item?.id || JSON.stringify(item)).join(", ");
+  }
+  if (typeof value === "string") return value || emptyLabel;
+  if (isCount(value)) return String(value);
+  return "—";
+}
+
+function formatVerdicts(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "—";
+  const entries = Object.entries(value).filter(([, count]) => isCount(count));
+  return entries.length ? entries.map(([verdict, count]) => `${verdict}: ${count}`).join(", ") : "None";
+}
+
+function formatLastFailure(value) {
+  if (!value || typeof value !== "string") return "—";
+  return value.replace("T", " ").replace(/Z$/, " UTC");
 }
 
 export default function PipelineMonitor() {
   const [incidents, setIncidents] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const [incidentError, setIncidentError] = useState(null);
+  const [pipelines, setPipelines] = useState(null);
+  const [company, setCompany] = useState(null);
+  const [pipelineLoading, setPipelineLoading] = useState(true);
+  const [pipelineError, setPipelineError] = useState(null);
+  const [incidentLoading, setIncidentLoading] = useState(true);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState(STATUS_FILTERS[0]);
   const [selectedDag, setSelectedDag] = useState("");
@@ -30,54 +55,85 @@ export default function PipelineMonitor() {
   useEffect(() => {
     let active = true;
     api.listIncidents().then((rows) => {
-      if (active) { setIncidents(rows || []); setError(null); }
-    }).catch((requestError) => { if (active) setError(requestError.message); })
-      .finally(() => { if (active) setLoading(false); });
+      if (active) { setIncidents(rows || []); setIncidentError(null); }
+    }).catch((requestError) => { if (active) setIncidentError(requestError.message); })
+      .finally(() => { if (active) setIncidentLoading(false); });
+    api.listPipelines().then((response) => {
+      if (!active) return;
+      if (USE_MOCKS && response === null) {
+        setPipelines(null);
+        setCompany(null);
+        setPipelineError(null);
+      } else if (response && Array.isArray(response.pipelines)) {
+        setPipelines(response.pipelines);
+        setCompany(typeof response.company === "string" ? response.company : null);
+        setPipelineError(null);
+      } else {
+        setPipelines(null);
+        setCompany(null);
+        setPipelineError("The response did not contain a pipeline list.");
+      }
+    }).catch((requestError) => { if (active) setPipelineError(requestError.message); })
+      .finally(() => { if (active) setPipelineLoading(false); });
     return () => { active = false; };
   }, []);
 
-  const pipelines = useMemo(() => groupByDag(incidents), [incidents]);
-  const visible = pipelines.filter((pipeline) => {
-    const searchText = `${pipeline.dag_id} ${pipeline.incidents.map((incident) => `${incident.task_id || ""} ${incident.error_class || ""}`).join(" ")}`.toLowerCase();
+  const pipelineRows = Array.isArray(pipelines) ? pipelines : [];
+  const visible = useMemo(() => pipelineRows.filter((pipeline) => {
+    const taskSearchText = [pipeline.tasks, pipeline.failing_tasks, pipeline.flaky_tasks]
+      .map((tasks) => Array.isArray(tasks) ? tasks.join(" ") : String(tasks || ""))
+      .join(" ");
+    const searchText = `${pipeline.dag_id || ""} ${taskSearchText}`.toLowerCase();
     if (query && !searchText.includes(query.toLowerCase())) return false;
-    if (status === "Active incident" && !pipeline.hasActive) return false;
-    if (status === "Resolved incidents" && pipeline.hasActive) return false;
+    if (status === "Active incident" && !(isCount(pipeline.open_incidents) && pipeline.open_incidents > 0)) return false;
+    if (status === "Resolved incidents" && !(isCount(pipeline.incidents) && pipeline.incidents > 0 && pipeline.open_incidents === 0)) return false;
     return true;
-  });
+  }), [pipelineRows, query, status]);
   const selected = visible.find((pipeline) => pipeline.dag_id === selectedDag) || visible[0];
-  const flakyTasks = new Set(incidents.filter((incident) => incident.diagnosis?.verdict === "FLAKY").map((incident) => `${incident.dag_id}.${incident.task_id}`));
-  const activeIncidents = incidents.filter((incident) => incident.status !== "resolved");
+  const incidentPipelines = useMemo(() => groupByDag(incidents), [incidents]);
   const flakyIncidents = incidents.filter((incident) => incident.diagnosis?.verdict === "FLAKY");
+  const activeIncidents = incidents.filter((incident) => incident.status !== "resolved");
+  const selectedIncident = incidentPipelines.find((pipeline) => pipeline.dag_id === selected?.dag_id)?.incidents[0];
+
+  let emptyMessage = "";
+  if (pipelineLoading) emptyMessage = "Loading pipeline inventory…";
+  else if (pipelineError) emptyMessage = "Pipeline inventory could not be loaded.";
+  else if (USE_MOCKS && pipelines === null) emptyMessage = "Pipeline inventory is not included in mock data.";
+  else if (!pipelineRows.length) emptyMessage = "The API returned no pipelines.";
+  else emptyMessage = "No pipelines match these filters.";
 
   return <div>
-    <div className="page-heading"><div><h1>Pipeline Monitor</h1><p>Review pipeline IDs that appear in incident records.</p></div><span className="badge badge-blue">Incident data only</span></div>
-    {error && <p className="inline-error" role="alert">Could not load incident context: {error}</p>}
-    <section className="kpi-grid" aria-label="Pipeline monitor metrics">
-      <div className="kpi"><div className="kpi-label">Pipeline inventory</div><div className="kpi-value">—</div><div className="kpi-note">No inventory endpoint in the current client</div></div>
-      <div className="kpi"><div className="kpi-label">Successful runs</div><div className="kpi-value">—</div><div className="kpi-note">Run history is unavailable</div></div>
-      <div className="kpi"><div className="kpi-label">Failed runs</div><div className="kpi-value">—</div><div className="kpi-note">Incidents do not provide run totals</div></div>
-      <div className="kpi"><div className="kpi-label">Tasks diagnosed as flaky</div><div className="kpi-value">{flakyTasks.size}</div><div className="kpi-note">Distinct tasks in returned diagnoses</div></div>
-    </section>
+    <div className="page-heading"><div><h1>Pipeline Monitor</h1><p>Review DAGs, tasks, and incident context{company ? ` for ${company}` : ""}.</p></div><span className={`badge ${USE_MOCKS ? "badge-amber" : "badge-blue"}`}>{USE_MOCKS ? "Inventory unavailable in mock mode" : "API pipeline inventory"}</span></div>
+    {pipelineError && <p className="inline-error" role="alert">Could not load pipeline inventory: {pipelineError}</p>}
+    {incidentError && <p className="inline-error" role="alert">Could not load incident watchlist: {incidentError}</p>}
 
-    <div className="monitor-grid" style={{ marginTop: 14 }}>
-      <section className="panel panel-pad"><div className="panel-heading-row"><div><h2 className="panel-title">Run health</h2><p className="panel-subtitle">Successful and failed run history is not present in the incident API response.</p></div></div><div className="unavailable-state">No run-health chart can be derived from incident records alone. The current API client has no pipeline-run history method.</div></section>
-      <section className="panel panel-pad"><div className="panel-heading-row"><div><h2 className="panel-title">Flaky task watchlist</h2><p className="panel-subtitle">Tasks marked FLAKY in diagnoses. {activeIncidents.length} active incidents are in the current response.</p></div></div>
-        {flakyIncidents.length ? <ul className="watchlist">{flakyIncidents.map((incident) => <li key={incident.id}><span><strong>{incident.dag_id}.{incident.task_id}</strong><small>{incident.error_class} · {incident.occurred_at?.slice(0, 10) || "date unavailable"}</small></span><Link to={`/incidents/${incident.id}`} className="table-link">Incident →</Link></li>)}</ul> : <div className="unavailable-state">No returned diagnosis is marked FLAKY.</div>}
-      </section>
-    </div>
+    <section className="panel panel-pad" style={{ marginTop: 14 }}>
+      <div className="panel-heading-row"><div><h2 className="panel-title">Flaky task watchlist</h2><p className="panel-subtitle">Incident diagnoses marked FLAKY. {incidentLoading ? "Loading incident context…" : `${activeIncidents.length} active incidents are in the current response.`}</p></div></div>
+      {flakyIncidents.length ? <ul className="watchlist">{flakyIncidents.map((incident) => <li key={incident.id}><span><strong>{incident.dag_id}.{incident.task_id}</strong><small>{incident.error_class} · {incident.occurred_at?.slice(0, 10) || "date unavailable"}</small></span><Link to={`/incidents/${incident.id}`} className="table-link">Incident →</Link></li>)}</ul> : <div className="unavailable-state">{incidentLoading ? "Loading incident context…" : "No returned diagnosis is marked FLAKY."}</div>}
+    </section>
 
     <section className="panel monitor-table-panel" style={{ marginTop: 14 }}>
-      <div className="panel-pad monitor-toolbar"><div><h2 className="panel-title">Pipelines observed in incidents</h2><p className="panel-subtitle">This list is not a complete pipeline inventory.</p></div><div className="toolbar"><input className="field" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search DAG or task…" aria-label="Search observed pipelines" /><select className="select-field" value={status} onChange={(event) => setStatus(event.target.value)} aria-label="Filter observed pipeline status">{STATUS_FILTERS.map((filter) => <option key={filter}>{filter}</option>)}</select></div></div>
-      <div className="table-wrap"><table className="data-table"><thead><tr><th>DAG ID</th><th>Incident context</th><th>Incident status</th><th>Last incident · UTC</th><th>Recent runs</th><th>Owner</th><th>Schedule</th></tr></thead><tbody>
-        {visible.map((pipeline) => {
-          const latest = pipeline.incidents[0];
-          return <tr key={pipeline.dag_id} className={selected?.dag_id === pipeline.dag_id ? "selected-row" : ""} onClick={() => setSelectedDag(pipeline.dag_id)}><td><button type="button" className="table-select">{pipeline.dag_id}</button></td><td>{pipeline.incidents.length} incident{pipeline.incidents.length === 1 ? "" : "s"} · {latest?.task_id || "task unavailable"}</td><td><span className={pipeline.hasActive ? "status-pending" : "status-diagnosed"}>{pipeline.hasActive ? "Active incident" : "Resolved incidents"}</span></td><td className="mono muted">{latest?.occurred_at?.replace("T", " ").slice(0, 16) || "Unavailable"}</td><td className="muted">Unavailable</td><td className="muted">Unavailable</td><td className="muted">Unavailable</td></tr>;
-        })}
-        {!visible.length && <tr><td colSpan={7} className="empty-state">{loading ? "Loading incident context…" : error ? "Incident context could not be loaded." : pipelines.length ? "No observed pipelines match these filters." : "No incident records include a DAG ID."}</td></tr>}
+      <div className="panel-pad monitor-toolbar"><div><h2 className="panel-title">Pipeline inventory</h2><p className="panel-subtitle">DAGs and tasks from the pipeline API, including pipelines with no incidents.</p></div><div className="toolbar"><input className="field" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search DAG or task…" aria-label="Search pipelines and tasks" /><select className="select-field" value={status} onChange={(event) => setStatus(event.target.value)} aria-label="Filter pipelines by incident status">{STATUS_FILTERS.map((filter) => <option key={filter}>{filter}</option>)}</select></div></div>
+      <div className="table-wrap"><table className="data-table"><thead><tr><th>DAG ID</th><th>Tasks</th><th>Total incidents</th><th>Open incidents</th><th>Last failure · UTC</th><th>Failing tasks</th><th>Flaky tasks</th><th>Verdicts</th></tr></thead><tbody>
+        {visible.map((pipeline) => <tr key={pipeline.dag_id} className={selected?.dag_id === pipeline.dag_id ? "selected-row" : ""} onClick={() => setSelectedDag(pipeline.dag_id)}>
+          <td><button type="button" className="table-select">{pipeline.dag_id || "—"}</button></td>
+          <td className="mono">{formatList(pipeline.tasks)}</td>
+          <td>{isCount(pipeline.incidents) ? pipeline.incidents : "—"}</td>
+          <td>{isCount(pipeline.open_incidents) ? pipeline.open_incidents : "—"}</td>
+          <td className="mono muted">{formatLastFailure(pipeline.last_failure_at)}</td>
+          <td>{formatList(pipeline.failing_tasks)}</td>
+          <td>{formatList(pipeline.flaky_tasks)}</td>
+          <td>{formatVerdicts(pipeline.verdicts)}</td>
+        </tr>)}
+        {!visible.length && <tr><td colSpan={8} className="empty-state">{emptyMessage}</td></tr>}
       </tbody></table></div>
-      <div className="table-footnote">Observed DAGs come only from existing incident records. Run history, owner, and schedule require fields not provided by the current API.</div>
+      <div className="table-footnote">{pipelineLoading ? "Loading inventory…" : pipelineError ? "Pipeline inventory is unavailable." : USE_MOCKS && pipelines === null ? "Enable real API mode to load the backend inventory." : `${visible.length} of ${pipelineRows.length} pipelines shown.`}</div>
     </section>
 
-    <section className="panel panel-pad selected-pipeline" aria-live="polite"><div className="panel-heading-row"><div><span className="section-label">Selected pipeline context</span><h2 className="panel-title">{selected?.dag_id || "No pipeline selected"}</h2></div>{selected?.incidents[0] && <Link to={`/incidents/${selected.incidents[0].id}`} className="table-link">Open latest incident →</Link>}</div><p className="panel-subtitle">{selected ? `${selected.incidents.length} returned incident record${selected.incidents.length === 1 ? "" : "s"} for this DAG. This does not represent pipeline health or full run history.` : "Select an observed DAG to view its related incident context."}</p></section>
+    <section className="panel panel-pad selected-pipeline" aria-live="polite"><div className="panel-heading-row"><div><span className="section-label">Selected pipeline context</span><h2 className="panel-title">{selected?.dag_id || "No pipeline selected"}</h2></div>{selectedIncident && <Link to={`/incidents/${selectedIncident.id}`} className="table-link">Open latest incident →</Link>}</div>
+      {selected
+        ? <><p className="panel-subtitle">{formatList(selected.tasks)} · {isCount(selected.incidents) ? selected.incidents : "—"} total incidents · {isCount(selected.open_incidents) ? selected.open_incidents : "—"} open</p><p className="panel-subtitle">Failing tasks: {formatList(selected.failing_tasks)} · Flaky tasks: {formatList(selected.flaky_tasks)} · Verdicts: {formatVerdicts(selected.verdicts)}</p></>
+        : <p className="panel-subtitle">{pipelineLoading ? "Loading pipeline details…" : "Select a pipeline to view its tasks and incident summary."}</p>}
+    </section>
   </div>;
 }

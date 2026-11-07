@@ -52,7 +52,7 @@ export default function App() {
         </div>
         <div className="workspace-label">
           <span className="workspace-avatar">N</span>
-          <span><strong>Data pipelines</strong><small>Production workspace</small></span>
+          <span><strong>Data pipelines</strong><small>QuickBasket (demo)</small></span>
         </div>
         <nav className="primary-nav" aria-label="Main navigation">
           {navItems.map(({ to, label, icon, end }) => (
@@ -63,7 +63,7 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-section-label">ENVIRONMENT</div>
-        <div className="environment-row"><span className="status-dot" />Production</div>
+        <div className="environment-row"><span className="status-dot" />QuickBasket (demo)</div>
         <div className="environment-detail">Pipeline incident workspace</div>
         {USE_MOCKS && <div className="sidebar-mode">Mock data enabled</div>}
         <div className="sidebar-spacer" />
