@@ -286,4 +286,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        MemoryStore.close_all()  # close Hindsight clients: no "Unclosed client session" noise

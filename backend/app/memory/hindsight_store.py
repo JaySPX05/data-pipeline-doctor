@@ -38,6 +38,7 @@ import json
 import logging
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
@@ -132,6 +133,15 @@ def is_outage(exc: BaseException) -> bool:
 
 
 class MemoryStore:
+
+    _instances: "weakref.WeakSet[MemoryStore]" = weakref.WeakSet()
+
+    @classmethod
+    def close_all(cls) -> None:
+        """Close every store's clients. CLI entry points call this on the way out."""
+        for store in list(cls._instances):
+            store.close()
+
     def __init__(
         self,
         cfg: Settings = default_settings,
@@ -168,6 +178,8 @@ class MemoryStore:
         self._wallclock = wallclock  # real date/time, for the outbox age limit
         self.last_exc: BaseException | None = None
         self._local = threading.local()  # per-thread clients, see module docstring
+        self._owned: list[tuple[int, Any]] = []  # (thread id, client) for close()
+        MemoryStore._instances.add(self)
         self._lock = threading.Lock()
         self._bank_ready = False
         self._down_until = 0.0
@@ -195,7 +207,49 @@ class MemoryStore:
         if client is None:
             client = self._client_factory(timeout)
             setattr(self._local, kind, client)
+            with self._lock:
+                self._owned.append((threading.get_ident(), client))
         return client
+
+    def _close_mine(self) -> int:
+        """Close the clients this thread created. Each one runs on this thread's event loop."""
+        me = threading.get_ident()
+        with self._lock:
+            mine = [c for t, c in self._owned if t == me]
+            self._owned = [(t, c) for t, c in self._owned if t != me]
+        for kind in [k for k, v in vars(self._local).items() if any(v is c for c in mine)]:
+            delattr(self._local, kind)  # a later call on this thread makes a fresh client
+        for c in mine:
+            try:
+                c.close()
+            except Exception as e:  # never let cleanup hide the real result
+                log.debug("closing Hindsight client failed: %s", e)
+        return len(mine)
+
+    def close(self) -> None:
+        """Close every Hindsight client (stops aiohttp's "Unclosed client session" warnings).
+
+        A client must be closed on the thread that made it, because each thread has its own
+        event loop. Recall clients live on pool threads, so one close job runs on every pool
+        thread: the barrier makes each job wait until all of them are running, so no thread
+        can take two. Call it when a CLI run ends; the API process never needs it.
+        """
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            n = pool._max_workers
+            barrier = threading.Barrier(n)
+
+            def job() -> int:
+                try:
+                    barrier.wait(timeout=5)
+                except threading.BrokenBarrierError:
+                    pass
+                return self._close_mine()
+
+            futures = [pool.submit(job) for _ in range(n)]
+            wait(futures, timeout=10)
+            pool.shutdown(wait=False)
+        self._close_mine()
 
     @property
     def client(self):

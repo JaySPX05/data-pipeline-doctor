@@ -72,6 +72,8 @@ def run(day_from=C.SEED_DAYS[0], day_to=C.SEED_DAYS[1], bank_id=C.BANK_ID, base_
                     print(f"  {done}/{len(items)} retained")
             except Exception as e:
                 failed.append((futs[f]["document_id"], f"{type(e).__name__}: {e}"))
+        # Close on a worker thread: the client's HTTP session lives on the loop that used it.
+        ex.submit(C.close_quietly, client).result()
     print(f"Done: {done} retained, {len(failed)} failed")
     for doc, err in failed[:10]:
         print(f"  FAILED {doc}: {err}")
