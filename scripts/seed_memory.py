@@ -7,7 +7,7 @@ metadata and tags (dag:, task:, fp:, kind:). Idempotent: re-running updates the 
 
   python scripts/seed_memory.py --dry-run          # print what would be retained
   python scripts/seed_memory.py                    # seed days 1-14
-  python scripts/seed_memory.py --workers 8        # faster (Hindsight runs LLM extraction per retain)
+  python scripts/seed_memory.py --workers 1     # faster (Hindsight runs LLM extraction per retain)
 """
 from __future__ import annotations
 
@@ -85,7 +85,7 @@ if __name__ == "__main__":
     ap.add_argument("--bank-id", default=C.BANK_ID)
     ap.add_argument("--base-url", default=None, help="default: $HINDSIGHT_URL or http://localhost:8888")
     ap.add_argument("--api-key", default=None)
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     sys.exit(0 if run(a.from_day, a.to_day, a.bank_id, a.base_url, a.api_key, a.workers, a.dry_run) else 1)
