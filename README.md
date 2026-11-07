@@ -32,47 +32,64 @@ React dashboard: diagnosis card + evidence ── engineer feedback
 | `recall` | Before every diagnosis | Past failures of this task/fingerprint, flakiness, recent upstream changes |
 | `reflect` | Insights page | Pipeline Health Brief: noisiest tasks, repeat offenders, permanent fixes |
 
-Corrections matter most. When an engineer says the agent was wrong, the correction is retained, and the next similar failure gets the right answer.
+Corrections matter most. When an engineer says the agent was wrong, the correction is retained, and the next similar failure gets the right answer. The agent's own guesses are never retained, so a wrong guess can't come back as evidence for itself.
+
+**Guardrails: memory beats the model.** The LLM proposes a diagnosis; plain Python rules in `backend/app/agent/guardrails.py` decide how much of it to believe. Every rule that fires is logged with its reason: in the backend log, `python -m app.agent` and the eval output.
+
+| # | Rule | Why |
+| --- | --- | --- |
+| 1 | KNOWN_ISSUE or FLAKY needs history for this task, or it becomes NEW (confidence ≤ 0.5) | "Known" must be backed by memory |
+| 1b | If every past outcome for this failure passed on retry, it's FLAKY | Nobody ever fixed it, so don't page anyone |
+| 2 | UPSTREAM_CHANGE needs a change from the 72 h before the failure (change feed, scheduler or memory), or it becomes NEW | A deploy from last week isn't a cause |
+| 3 | Confidence above 0.95 needs an exact fingerprint match | Near-certainty only for the same failure |
+| 4 | A diagnosis that contradicts the latest correction for this fingerprint is capped at 0.5 and pages, and the correction is cited first | What the team said wins |
+| 5 | Only FLAKY at 0.8 or more skips the page | Everything else wakes a human |
 
 ## Quick start
 
+The team runs memory on **Hindsight Cloud**. Self-hosted Hindsight needs an LLM budget for its own fact extraction that the free Groq tier can't give (see below).
+
 ```bash
-cp .env.example .env              # add your GROQ_API_KEY
-docker compose up --build         # Hindsight :8888 (UI :9999), API :8000, UI :5173
+cp .env.example .env     # add GROQ_API_KEY (+ optional GEMINI_API_KEY) and the Hindsight Cloud values below
+python -m venv .venv && . .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
+pip install -r backend/requirements.txt
+python scripts/seed_memory.py                     # the team's past: days 1-14 into Hindsight (112 memories)
+cd backend && uvicorn app.main:app --port 8000    # API on :8000, docs at /docs
+cd frontend && npm install && npm run dev         # UI on :5173 (another terminal, from the repo root)
 ```
 
-Without Docker:
+With Docker instead: `make up-cloud`, then `make seed`, then `make replay`. That starts only the backend and frontend, and memory goes to Cloud.
+
+Replay the rest of the month and watch it learn:
 
 ```bash
-make setup                        # venv + npm install
-docker run --rm -it -p 8888:8888 -p 9999:9999 \
-  -e HINDSIGHT_API_LLM_PROVIDER=groq -e HINDSIGHT_API_LLM_API_KEY=$GROQ_API_KEY \
-  -v $HOME/.hindsight-docker:/home/hindsight/.pg0 ghcr.io/vectorize-io/hindsight:latest
-make backend                      # terminal 2
-make frontend                     # terminal 3
-```
-
-Run the demo:
-
-```bash
-make demo      # reset, generate 30 days of data, seed days 1-14 into Hindsight
-make replay    # replay days 15-30 live; watch the inbox and the Insights page
+python scripts/replay.py --from-day 15 --to-day 30 --speed 60x --max-gap 3 --auto-feedback
 ```
 
 No API keys yet? The backend runs offline: the agent falls back to a rule-based diagnosis and memory calls are skipped (`MEMORY_ENABLED=false`). Frontend devs can use `VITE_USE_MOCKS=true npm run dev`.
+
+**Self-hosted Hindsight** (`make up`, a large image) needs a paid Groq tier or another LLM provider for Hindsight itself. A free Groq key fails every retain with "`service_tier` `auto` is not available" (`HINDSIGHT_API_LLM_GROQ_SERVICE_TIER=on_demand` fixes that error, but the free tier's 8K tokens/min is still far below what a retain needs).
 
 ## Hindsight Cloud (what we use)
 
 Local Hindsight runs its own LLM extraction on every retain, which the Groq and Gemini free tiers can't sustain while seeding, so the team uses Hindsight Cloud.
 
-1. In `.env` set `HINDSIGHT_URL=<your Cloud API URL>`, `HINDSIGHT_API_KEY=<your key>`, `HINDSIGHT_BANK_ID=quickbasket-data-platform`, `MEMORY_ENABLED=true`.
+1. Sign up at [ui.hindsight.vectorize.io](https://ui.hindsight.vectorize.io), then **Connect → Create API Key**. In `.env` set:
+   ```
+   HINDSIGHT_URL=https://api.hindsight.vectorize.io
+   HINDSIGHT_URL_DOCKER=https://api.hindsight.vectorize.io   # what the backend container uses
+   HINDSIGHT_API_KEY=<your key>
+   HINDSIGHT_BANK_ID=quickbasket-data-platform
+   MEMORY_ENABLED=true
+   ```
 2. Seed the agent's past (days 1–14) from the repo root. The scripts read `.env` too: `python scripts/seed_memory.py`
-3. Run the backend locally (`cd backend` then `uvicorn app.main:app --port 8000`), or in Docker without the local Hindsight: set `HINDSIGHT_URL_DOCKER=<Cloud URL>` and run `docker compose up --build --no-deps backend frontend`.
-4. Check: http://localhost:8000/api/memory/status shows your Cloud URL, and `cd backend` then `python -m app.memory.smoke` passes.
+3. Run the backend locally (`cd backend` then `uvicorn app.main:app --port 8000`), or in Docker with `make up-cloud` (`docker compose up --build -d --no-deps backend frontend`; `--no-deps` keeps the local Hindsight image from starting).
+4. Check: http://localhost:8000/api/memory/status shows the Cloud URL, and `cd backend` then `python -m app.memory.smoke` passes.
+5. `python scripts/reset_demo.py --seeded` wipes and re-seeds the bank. It asks you to type the bank name first (`--dry-run` shows what it would do).
 
 ## Results: does memory help?
 
-`cd backend` then `python -m app.agent.eval --markdown` diagnoses failures from the replay window (days 15–30) twice, with and without memory, against a bank seeded with days 1–14, and scores each answer against P3's ground truth. It measures verdict accuracy, whether known failures were recognised, root-cause match, and correct page/don't-page decisions. It is read-only, so runs are repeatable. Raw results go to `data/generated/eval_results.jsonl`.
+`cd backend` then `python -m app.agent.eval --markdown` diagnoses failures from the replay window (days 15–30) twice, with and without memory, against a bank seeded with days 1–14, and scores each answer against P3's ground truth. It measures verdict accuracy, whether known failures were recognised, root-cause match, and correct page/don't-page decisions. It is read-only, so runs are repeatable. Raw results go to `data/generated/eval_results.jsonl`, with the guardrails that fired and the memories cited for each answer. Misses also print them. `--scenario S09` runs every scenario whose id starts with S09.
 
 **With memory on, verdict accuracy goes from 38.9% to 83.3%, and every repeat failure is recognised (46.7% → 100%).** This is a run on Hindsight Cloud on 2026-11-07: 18 failures from the replay window, 2 per scenario, against a bank seeded with days 1–14 (112 memories).
 
@@ -104,9 +121,9 @@ Local Hindsight runs its own LLM extraction on every retain, which the Groq and 
 - Root-cause match didn't move (55.6%). The scorer wants 40% of the ground truth's key words, and the agent often describes the right cause in its own words. Treat it as a lower bound.
 - Memory ON is slower (12.4 s vs 6.8 s per diagnosis) because of three recall queries plus Groq free-tier rate limits. Most calls fell back from `gpt-oss-120b` to the next model in the chain.
 - **The 3 misses with memory on led to two guardrail fixes** (`backend/app/agent/guardrails.py`, rules 1b and 2):
-  - S08: every past `dq_checks` failure had passed on retry, but the model called it KNOWN_ISSUE. Now a "known issue" whose past outcomes were all "passed on retry" is FLAKY, and so doesn't page.
+  - S08: every past `dq_checks` failure had passed on retry, but the model called it KNOWN_ISSUE (and, in a re-run, NEW). Now a failure whose past outcomes all passed on retry is FLAKY, and so doesn't page. For a NEW verdict this needs the exact fingerprint, so a new error on a usually-flaky task still pages.
   - S09c: a same-DAG change from 7.7 days earlier counted as evidence for UPSTREAM_CHANGE. Only changes from the 72 h before a failure count now, and an upstream change with none is downgraded to NEW.
-  - **Re-run of the missed scenarios after the fixes:** S08 went 0% → 100% with memory on (FLAKY both times, no page), and S09c went 0% → 100% (NEW). S09d and S09e stayed correct. In both S08 runs the model itself still said NEW. The guardrail saw this exact fingerprint pass on retry in memory and corrected the verdict, which is why the rules live in code and not in the prompt.
+  - **Re-runs of the missed scenarios after the fixes:** S08 was FLAKY with no page in all 6 runs over three re-runs since #23 (0% → 100%), and S09c went 0% → 100% (NEW). S09d and S09e stayed correct. Every S08 run came back at exactly 0.80 confidence, the floor rule 1b sets when it overrides a NEW: the model kept saying NEW, and the guardrail corrected it from memory. That's why the rules live in code and not in the prompt.
   - The full table above is from the run before the fixes. Every scenario that missed is now right in a targeted re-run, but the headline stays 83.3% until a full re-run (`python -m app.agent.eval --markdown`) confirms it.
 
 ## Groq free tier
@@ -118,6 +135,12 @@ Local Hindsight runs its own LLM extraction on every retain, which the Groq and 
 - For the demo, consider the pay-as-you-go Developer plan (much higher limits, cents of usage).
 - `model_not_found`? A model id was retired: check `LLM_MODEL` / `LLM_FALLBACK_MODEL` in your `.env` against https://console.groq.com/docs/models.
 
+## Tests and CI
+
+- `cd backend && pytest -q`: 140 tests, fully offline (no keys, no Hindsight). They cover fingerprinting on real-looking logs, every guardrail, the LLM fallback chain, the API, the eval scorer and memory-client cleanup.
+- `make e2e` (or `python integrations/e2e/e2e_test.py --base-url http://localhost:8000`) checks the full loop against a running stack: failure → diagnosis card → feedback → memory → Health Brief. Add `E2E_ARGS=--no-memory` without Hindsight.
+- CI on every PR: backend tests, frontend build, and a `banned-word` check.
+
 ## Repo layout
 
 ```
@@ -125,18 +148,19 @@ backend/app/
   main.py              FastAPI app + /api/health
   config.py            settings from .env
   models/schemas.py    shared contracts (FROZEN after Day 1 midday)
-  api/                 failures, incidents, memory, metrics routes        (P1)
-  services/            fingerprinting + incident store                    (P1)
-  agent/               doctor.py loop, llm.py (Groq), tools.py            (P1)
-  memory/              hindsight_store.py: retain / recall / reflect      (P2)
-  prompts/             system prompt                                       (P1)
-backend/app/agent/eval.py  memory ON vs OFF evaluation                   (P1/P4)
-backend/tests/         pytest, runs fully offline                         (P4)
-data/scenarios/        failure scenario YAMLs                              (P3)
-scripts/               generate_history, seed_memory, replay, reset_demo   (P3)
-frontend/src/          React + Vite + Tailwind: Inbox, Incident, Insights, Memory (P5, P6)
-integrations/airflow/  on_failure_callback + example DAG                   (P7)
-docs/                  team split, content checklist                       (P7)
+  api/                 failures, incidents, memory, metrics, pipelines routes   (P1)
+  services/            fingerprinting, incident store, demo data loader         (P1)
+  agent/               doctor.py loop, llm.py (Groq/Gemini chain), tools.py,
+                       guardrails.py, eval.py (memory ON vs OFF)                (P1/P4)
+  memory/              hindsight_store.py: retain / recall / reflect, retry queue (P2)
+  prompts/             system prompt                                             (P1)
+backend/tests/         pytest, runs fully offline                               (P4)
+data/scenarios/        failure scenario YAMLs; data/generated/ = 30-day history (P3)
+scripts/               generate_history, seed_memory, replay, reset_demo         (P3)
+frontend/src/pages/    Overview, Inbox, Incident, Pipeline Monitor, Insights, Memory (P5, P6)
+integrations/airflow/  on_failure_callback + example DAG                         (P7)
+integrations/e2e/      full-loop check against a running stack                   (P7)
+docs/                  architecture, team split, content + submission checklists (P7)
 ```
 
 ## API
@@ -144,11 +168,13 @@ docs/                  team split, content checklist                       (P7)
 | Method + path | Purpose |
 | --- | --- |
 | `POST /api/failures` | Ingest a failure, diagnose it, return the incident |
-| `GET /api/incidents` | Inbox, newest first: `status`, `verdict`, `dag_id`, `q` (search), `limit`, `offset`; total in `X-Total-Count` |
+| `GET /api/health` | LLM chain and memory status |
+| `GET /api/incidents` | Inbox, newest first: `status`, `verdict`, `dag_id`, `q` (search), `limit`, `offset`; total in `X-Total-Count`. Unknown `status`/`verdict` values return 422 |
 | `GET /api/incidents/{id}` | Incident + diagnosis card |
 | `POST /api/incidents/{id}/feedback` | Confirm/correct → retained in Hindsight |
 | `POST /api/incidents/{id}/rediagnose?memory=false` | Same incident without memory (before/after) |
 | `GET /api/memory/search?q=` | Recall from the bank |
+| `GET /api/memory/status` | Hindsight URL, bank, last error, breaker and retry-queue state |
 | `POST /api/reflect` | Pipeline Health Brief |
 | `GET /api/metrics/learning-curve` | Auto-diagnosed % and accuracy per day |
 | `GET /api/pipelines` | The 6 demo DAGs and their tasks (from `data/dags.yaml`) with incident stats per DAG |
