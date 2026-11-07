@@ -65,8 +65,13 @@ def main():
         print("Dry run: nothing was changed.")
         return
     if not a.yes:
-        if input(f"Type the bank name '{a.bank_id}' to confirm: ").strip() != a.bank_id:
-            print("Cancelled. Nothing was changed.")
+        try:
+            answer = input(f"Type the bank name '{a.bank_id}' to confirm: ").strip()
+        except EOFError:  # no terminal to ask (CI, piped input)
+            answer = ""
+            print()
+        if answer != a.bank_id:
+            print("Cancelled. Nothing was changed. (Pass --yes to skip this prompt.)")
             return
 
     print("1/3 Hindsight bank")
