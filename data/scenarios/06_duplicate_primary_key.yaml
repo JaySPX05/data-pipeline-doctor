@@ -1,0 +1,20 @@
+# S06: late-arriving CDC events cause duplicate key on merge.
+id: S06
+name: duplicate_primary_key
+dag_id: customer_360
+task_id: merge_profiles
+verdict: KNOWN_ISSUE
+error_class: IntegrityError
+error_lines:
+  - "sqlalchemy.exc.IntegrityError: (psycopg2.errors.UniqueViolation) duplicate key value violates unique constraint \"profiles_pkey\""
+  - "DETAIL:  Key (profile_id)=({profile_id}) already exists."
+core_frames:
+  - {file: "{path}/merge_profiles.py", fn: run, code: "session.bulk_insert_mappings(Profile, batch)"}
+  - {file: "/home/airflow/.local/lib/python3.11/site-packages/sqlalchemy/engine/base.py", fn: _execute_context, code: "self.dialect.do_execute(cursor, statement, parameters, context)"}
+root_cause: "Late-arriving CDC events replayed an already-merged profile_id."
+fix: "Deduplicated the CDC batch on (profile_id, updated_at) and re-ran merge_profiles."
+minutes_to_resolve: {base: 9, jitter: 3}
+auto_retry_passes: false
+schedule:
+  random: {count: 12}           # plan says ~1/week; 12 over 30 days
+  hour_range: [2, 7]

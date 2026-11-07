@@ -12,8 +12,14 @@ venv/
 .pytest_cache/
 
 # data
-data/generated/
+
 data/*.sqlite3
+# per-machine memory state (P2): must never be committed, even if data/generated/ is tracked.
+# memory_outbox_*: queued retains waiting to be resent; health_brief_*: last good Health Brief cache.
+data/generated/memory_outbox_*
+data/generated/health_brief_*
+data/generated/recall_eval.jsonl
+data/generated/eval_results.jsonl
 
 # node
 node_modules/

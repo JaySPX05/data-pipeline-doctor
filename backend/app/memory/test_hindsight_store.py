@@ -77,7 +77,9 @@ def make_store(fake: FakeClient | None = None, clock: Clock | None = None, **kw)
     fake = fake or FakeClient()
     clock = clock or Clock()
     cfg = Settings(memory_enabled=True, hindsight_url="http://fake:8888", hindsight_api_key="", hindsight_bank_id="test-bank")
-    kw.setdefault("brief_cache_path", Path(tempfile.mkdtemp()) / "brief.json")  # never touch data/generated
+    tmp = Path(tempfile.mkdtemp())
+    kw.setdefault("brief_cache_path", tmp / "brief.json")  # never touch data/generated
+    kw.setdefault("outbox_path", tmp / "outbox.jsonl")
     store = MemoryStore(cfg, client_factory=lambda timeout: fake, clock=clock, **kw)
     return store, fake, clock
 
@@ -94,7 +96,8 @@ def incident(id="inc_1", fp="fp_abc") -> Incident:
 def test_recall_queries_are_scoped_with_strict_tags():
     store, fake, _ = make_store(FakeClient(lambda kw: SimpleNamespace(results=[result("m")])))
     store.recall_for_incident(incident())
-    q1, q2, q3 = fake.recalls()
+    by_first_tag = {q["tags"][0]: q for q in fake.recalls()}   # queries run in parallel: order varies
+    q1, q2, q3 = by_first_tag["task:orders_etl.load_orders"], by_first_tag["dag:orders_etl"], by_first_tag["kind:change"]
     assert q1["tags"] == ["task:orders_etl.load_orders", "fp:fp_abc"] and q1["tags_match"] == "any_strict"
     assert q2["tags"] == ["dag:orders_etl"] and q2["tags_match"] == "any_strict"
     assert q3["tags"] == ["kind:change", "dag:orders_etl"] and q3["tags_match"] == "all_strict"
@@ -110,12 +113,13 @@ def test_falls_back_to_untagged_search_when_strict_tags_find_nothing():
     store, fake, _ = make_store(FakeClient(on_recall))
     ev = store.recall_for_incident(incident())
     assert [e.text for e in ev] == ["found by text"]
-    assert "tags" not in fake.recalls()[1]  # the safety-net query right after query 1
+    assert any("tags" not in q for q in fake.recalls())  # the untagged safety-net query ran
 
 
 def test_dedupes_and_keeps_query_order():
-    answers = iter([[result("a"), result("b")], [result("b"), result("c")], [result("d")]])
-    store, _, _ = make_store(FakeClient(lambda kw: SimpleNamespace(results=next(answers))))
+    answers = {"task:orders_etl.load_orders": [result("a"), result("b")],
+               "dag:orders_etl": [result("b"), result("c")], "kind:change": [result("d")]}
+    store, _, _ = make_store(FakeClient(lambda kw: SimpleNamespace(results=answers[kw["tags"][0]])))
     assert [e.text for e in store.recall_for_incident(incident())] == ["a", "b", "c", "d"]
 
 
@@ -129,13 +133,14 @@ def test_never_returns_memories_from_the_incident_itself():
 def test_hindsight_down_returns_no_evidence_and_opens_breaker():
     store, fake, clock = make_store(FakeClient(lambda kw: ConnectionError("refused")))
     assert store.recall_for_incident(incident()) == []
-    assert fake.count("recall") == 1          # breaker stopped queries 2 and 3
+    first = fake.count("recall")
+    assert 1 <= first <= 3                     # the 3 queries go out at once
     assert not store.available
     assert store.status()["breaker_open_for_s"] == 30.0
 
     store.recall_for_incident(incident(fp="fp_other"))
     store.retain_failure(incident())
-    assert fake.count("recall") == 1 and fake.count("retain") == 0  # nothing waits on a dead server
+    assert fake.count("recall") == first and fake.count("retain") == 0  # nothing waits on a dead server
 
     clock.t += 31                              # cooldown over: try again
     fake.on_recall = lambda kw: SimpleNamespace(results=[result("back")])
@@ -168,11 +173,38 @@ def test_slow_hindsight_stops_at_recall_budget():
         return SimpleNamespace(results=[result(f"m{clock.t}")])
 
     store, fake, _ = make_store(FakeClient(slow), clock=clock, recall_budget_s=5.0)
+    store.parallel_recall = False               # sequential mode: the budget is checked between queries
     ev = store.recall_for_incident(incident())
     assert fake.count("recall") == 2            # 3rd query skipped: 6 s > 5 s budget
     assert len(ev) == 2
     store.recall_for_incident(incident())
     assert fake.count("recall") == 4            # incomplete results are not cached
+
+
+def test_parallel_recall_waits_for_the_slowest_query_not_the_sum():
+    def slow(kw):
+        time.sleep(0.3)
+        return SimpleNamespace(results=[result(kw["tags"][0])])
+
+    store, fake, _ = make_store(FakeClient(slow))
+    t0 = time.perf_counter()
+    ev = store.recall_for_incident(incident())
+    took = time.perf_counter() - t0
+    assert fake.count("recall") == 3 and len(ev) == 3
+    assert took < 0.7                           # ~0.3 s in parallel, would be ~0.9 s one after another
+    assert [e.text for e in ev] == ["task:orders_etl.load_orders", "dag:orders_etl", "kind:change"]
+
+
+def test_parallel_recall_stops_at_the_budget_and_does_not_cache():
+    def slow(kw):
+        time.sleep(0.6)
+        return SimpleNamespace(results=[result("late")])
+
+    store, fake, _ = make_store(FakeClient(slow), recall_budget_s=0.2)
+    t0 = time.perf_counter()
+    assert store.recall_for_incident(incident()) == []   # nothing came back within 0.2 s
+    assert time.perf_counter() - t0 < 0.5                 # the diagnosis did not wait for the slow server
+    assert store.status()["cached_recalls"] == 0          # incomplete results are not cached
 
 
 def test_real_client_against_slow_server_times_out_fast():
@@ -227,7 +259,9 @@ def test_bank_created_with_new_mission_fields_and_retried_after_failure():
 
     fake.create_bank_error = None
     store.retain_failure(incident())
-    assert store._bank_ready and fake.count("retain") == 1
+    # the first memory was queued (not lost) and is resent before the second one
+    assert store._bank_ready and fake.count("retain") == 2
+    assert store.status()["outbox_pending"] == 0
     kw = [k for n, k in fake.calls if n == "create_bank"][-1]
     assert "reflect_mission" in kw and "retain_mission" in kw and "mission" not in kw
 
@@ -237,12 +271,12 @@ def test_one_client_per_thread():
     cfg = Settings(memory_enabled=True, hindsight_url="http://fake", hindsight_bank_id="b")
     store = MemoryStore(cfg, client_factory=lambda timeout: made.append(timeout) or FakeClient())
     store._bank_ready = True
-    ids = []
+    clients = []                                 # keep references: ids of dead objects can be reused
     for _ in range(3):
-        t = threading.Thread(target=lambda: ids.append(id(store.recall_client)))
+        t = threading.Thread(target=lambda: clients.append(store.recall_client))
         t.start()
         t.join()
-    assert len(set(ids)) == 3
+    assert len({id(c) for c in clients}) == 3
     a, b = store.recall_client, store.recall_client
     assert a is b                                # reused within a thread
     assert made.count(5.0) == 4                  # recall clients get the short timeout
@@ -330,3 +364,173 @@ def test_memory_off_reflect_says_so(tmp_path):
     path.write_text(json.dumps({"text": "old brief", "generated_at": "x"}))
     store = MemoryStore(cfg, brief_cache_path=path)
     assert "switched off" in store.reflect()
+
+
+# ---------------------------------------------------------------- retry queue (outbox)
+def test_failed_retain_is_queued_and_resent_first():
+    store, fake, clock = make_store()
+    fake.retain = lambda **kw: (_ for _ in ()).throw(ConnectionError("down"))
+    store.retain_feedback(incident(), Feedback(correct=False, root_cause="vendor rename", fix="map cust_id"))
+    assert store.status()["outbox_pending"] == 1          # kept, not lost
+
+    clock.t += 31                                          # breaker closed again, Hindsight back
+    sent = []
+    fake.retain = lambda **kw: sent.append(kw["document_id"])
+    store.retain_failure(incident(id="inc_2"))
+    assert sent == ["inc_1-correction", "inc_2"]          # queued one first, then the new one
+    assert store.status()["outbox_pending"] == 0
+
+
+def test_queue_survives_a_restart(tmp_path):
+    path = tmp_path / "outbox.jsonl"
+    store, fake, _ = make_store(outbox_path=path)
+    fake.retain = lambda **kw: (_ for _ in ()).throw(ConnectionError("down"))
+    store.retain_failure(incident())
+
+    store2, fake2, _ = make_store(outbox_path=path)        # new process, same file
+    assert store2.status()["outbox_pending"] == 1
+    assert store2.flush_outbox() == 1 and fake2.count("retain") == 1
+    assert not path.exists()
+
+
+def test_resent_feedback_clears_the_recall_cache():
+    store, fake, clock = make_store(FakeClient(lambda kw: SimpleNamespace(results=[result("m")])))
+    store.recall_for_incident(incident())                  # cached
+    fake.retain = lambda **kw: (_ for _ in ()).throw(TimeoutError())
+    store.retain_feedback(incident(), Feedback(correct=False, root_cause="x", fix="y"))
+    clock.t += 31
+    fake.retain = lambda **kw: None
+    recalls = fake.count("recall")
+    store.recall_for_incident(incident())                  # re-cached before the correction is in
+    assert store.flush_outbox() == 1
+    store.recall_for_incident(incident())
+    assert fake.count("recall") > recalls + 3              # cache was cleared after the resend
+
+
+def test_poison_item_is_dropped_after_max_attempts():
+    from hindsight_client_api.exceptions import BadRequestException
+
+    store, fake, _ = make_store()
+    fake.retain = lambda **kw: (_ for _ in ()).throw(BadRequestException(status=400, reason="bad"))
+    store.retain_failure(incident())                       # queued (attempts 0)
+    for _ in range(5):
+        store.flush_outbox()
+    assert store.status()["outbox_pending"] == 0           # gave up instead of blocking the queue
+
+
+def test_memory_off_queues_nothing(tmp_path):
+    cfg = Settings(memory_enabled=False, hindsight_url="http://fake", hindsight_bank_id="b")
+    store = MemoryStore(cfg, outbox_path=tmp_path / "o.jsonl", brief_cache_path=tmp_path / "b.json")
+    store.retain_failure(incident())
+    assert not (tmp_path / "o.jsonl").exists()
+
+
+# ---------------------------------------------------------------- own observations
+def test_rediagnose_skips_observations_of_its_own_fingerprint():
+    from app.models.schemas import Diagnosis, Verdict
+
+    obs = result("summary of this incident's own correction", doc=None, tags=["fp:fp_abc", "kind:correction"])
+    other = result("resolution from an earlier incident", doc="inc_0-resolution", tags=["fp:fp_abc"])
+    store, _, _ = make_store(FakeClient(lambda kw: SimpleNamespace(results=[obs, other])))
+
+    fresh = incident()                                     # first diagnosis: keep everything
+    assert [e.text for e in store.recall_for_incident(fresh)] == [obs.text, other.text]
+
+    again = incident()
+    again.diagnosis = Diagnosis(verdict=Verdict.NEW, root_cause="?", suggested_fix="?", confidence=0.3)
+    assert [e.text for e in store.recall_for_incident(again)] == [other.text]
+
+
+# ---------------------------------------------------------------- retry queue: temporary vs permanent failures
+def quota_error():
+    """What Hindsight returns when its LLM quota is used up (seen on the real server)."""
+    from hindsight_client_api.exceptions import ServiceException
+
+    return ServiceException(status=500, reason="Fact extraction deferred by provider quota")
+
+
+def test_long_quota_outage_never_drops_the_correction():
+    """Review repro: correction queued, 5 more failures arrive during the outage, then quota returns."""
+    store, fake, _ = make_store()
+    quota_out, delivered = [True], []
+
+    def retain(**kw):
+        if quota_out[0]:
+            raise quota_error()
+        delivered.append(kw["document_id"])
+
+    fake.retain = retain
+    store.retain_feedback(incident(), Feedback(correct=False, root_cause="vendor rename", fix="map cust_id"))
+    for n in range(2, 7):                                  # 5 failures while the quota is still out
+        store.retain_failure(incident(id=f"inc_{n}"))
+
+    queued = store._read_outbox()
+    assert [i["kwargs"]["document_id"] for i in queued] == ["inc_1-correction"] + [f"inc_{n}" for n in range(2, 7)]
+    assert queued[0]["attempts"] == 0                      # quota errors are not the item's fault
+
+    quota_out[0] = False                                   # quota is back
+    store.retain_failure(incident(id="inc_7"))
+    assert delivered[0] == "inc_1-correction"              # the correction goes first
+    store.flush_outbox()
+    assert sorted(delivered) == sorted(["inc_1-correction"] + [f"inc_{n}" for n in range(2, 8)])
+    assert store.status()["outbox_pending"] == 0
+
+
+def test_rate_limit_429_is_not_counted_as_an_attempt():
+    from hindsight_client_api.exceptions import ApiException
+
+    store, fake, _ = make_store()
+    fake.retain = lambda **kw: (_ for _ in ()).throw(ApiException(status=429, reason="Too Many Requests"))
+    store.retain_failure(incident())
+    for _ in range(20):
+        store.flush_outbox()
+    assert store._read_outbox()[0]["attempts"] == 0
+    assert store.status()["outbox_pending"] == 1
+
+
+def test_permanently_rejected_item_does_not_block_the_queue():
+    from hindsight_client_api.exceptions import BadRequestException
+
+    store, fake, _ = make_store()
+    fake.retain = lambda **kw: (_ for _ in ()).throw(ConnectionError("down"))
+    store.retain_failure(incident(id="inc_bad"))
+    store.retain_failure(incident(id="inc_good"))
+    store._down_until = 0                                  # Hindsight is back
+
+    delivered = []
+
+    def retain(**kw):
+        if kw["document_id"] == "inc_bad":
+            raise BadRequestException(status=400, reason="invalid tags")
+        delivered.append(kw["document_id"])
+
+    fake.retain = retain
+    assert store.flush_outbox() == 1
+    assert delivered == ["inc_good"]                       # the good one got through behind the bad one
+    left = store._read_outbox()
+    assert [i["kwargs"]["document_id"] for i in left] == ["inc_bad"] and left[0]["attempts"] == 1
+
+
+def test_queued_memory_older_than_24_hours_is_dropped():
+    from datetime import timedelta
+
+    now = [datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)]
+    store, fake, _ = make_store(wallclock=lambda: now[0])
+    fake.retain = lambda **kw: (_ for _ in ()).throw(quota_error())
+    store.retain_failure(incident())
+    now[0] += timedelta(hours=23)
+    store.flush_outbox()
+    assert store.status()["outbox_pending"] == 1           # still within 24 h: kept
+    now[0] += timedelta(hours=2)
+    store.flush_outbox()
+    assert store.status()["outbox_pending"] == 0           # 25 h: dropped (logged), so nothing is stuck forever
+
+
+def test_is_permanent_classification():
+    from hindsight_client_api.exceptions import ApiException
+    from app.memory.hindsight_store import is_permanent
+
+    assert is_permanent(ApiException(status=400)) and is_permanent(ApiException(status=422))
+    for temporary in (ApiException(status=429), ApiException(status=408), ApiException(status=500),
+                      ApiException(status=503), TimeoutError(), ConnectionError(), None):
+        assert not is_permanent(temporary)

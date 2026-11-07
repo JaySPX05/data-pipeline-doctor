@@ -15,8 +15,25 @@ async function request(path, options = {}) {
 
 const delay = (v) => new Promise((r) => setTimeout(() => r(v), 250));
 
+const filterMockIncidents = ({ status, verdict, dag_id } = {}) =>
+  mocks.incidents.filter((incident) =>
+    (!status || incident.status === status) &&
+    (!verdict || incident.diagnosis?.verdict === verdict) &&
+    (!dag_id || incident.dag_id === dag_id),
+  );
+
+const incidentQuery = ({ status, verdict, dag_id } = {}) => {
+  const params = new URLSearchParams();
+  if (status) params.set("status", status);
+  if (verdict) params.set("verdict", verdict);
+  if (dag_id) params.set("dag_id", dag_id);
+  const query = params.toString();
+  return query ? `/api/incidents?${query}` : "/api/incidents";
+};
+
 export const api = {
-  listIncidents: () => (USE_MOCKS ? delay(mocks.incidents) : request("/api/incidents")),
+  listIncidents: (filters = {}) =>
+    USE_MOCKS ? delay(filterMockIncidents(filters)) : request(incidentQuery(filters)),
   getIncident: (id) =>
     USE_MOCKS ? delay(mocks.incidents.find((i) => i.id === id)) : request(`/api/incidents/${id}`),
   sendFeedback: (id, body) =>
@@ -28,6 +45,8 @@ export const api = {
   learningCurve: () => (USE_MOCKS ? delay(mocks.learningCurve) : request("/api/metrics/learning-curve")),
   reflect: () => (USE_MOCKS ? delay({ text: mocks.healthBrief }) : request("/api/reflect", { method: "POST", body: "{}" })),
   searchMemory: (q) =>
-    USE_MOCKS ? delay(mocks.memories) : request(`/api/memory/search?q=${encodeURIComponent(q)}`),
+    USE_MOCKS ? delay(mocks.searchMemories(q)) : request(`/api/memory/search?q=${encodeURIComponent(q)}`),
+  memoryStatus: () =>
+    USE_MOCKS ? delay({ mock: true }) : request("/api/memory/status"),
   health: () => (USE_MOCKS ? delay({ status: "ok" }) : request("/api/health")),
 };

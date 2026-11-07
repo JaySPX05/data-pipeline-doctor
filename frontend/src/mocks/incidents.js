@@ -97,3 +97,32 @@ export const healthBrief =
   "Pipeline Health Brief\n\n1. events_ingest.pull_kafka is the noisiest task (9 failures), but it is always flaky: auto-retry, no page.\n2. FreshFarm vendor releases broke orders_etl.load_orders 4 times. Fix permanently with a schema contract check before load.\n3. The weekly IAM key rotation for svc-inventory-export caused 4 incidents. Move the Airflow connection to Secrets Manager.";
 
 export const memories = evidence;
+
+const MEMORY_QUERY_STOP_WORDS = new Set([
+  "a", "an", "and", "are", "does", "did", "for", "how", "i", "is", "of", "the", "to", "was", "what", "when", "which", "who", "why",
+]);
+
+export function searchMemories(query) {
+  const terms = String(query || "")
+    .toLowerCase()
+    .split(/[^a-z0-9_]+/)
+    .filter((term) => term && !MEMORY_QUERY_STOP_WORDS.has(term));
+
+  if (terms.length === 0) return [];
+
+  return memories
+    .map((memory, index) => {
+      const searchableText = [
+        memory.text,
+        memory.type,
+        memory.occurred_at,
+        memory.document_id,
+        ...(memory.tags || []),
+      ].filter(Boolean).join(" ").toLowerCase();
+      const score = terms.reduce((total, term) => total + Number(searchableText.includes(term)), 0);
+      return { memory, index, score };
+    })
+    .filter(({ score }) => score > 0)
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map(({ memory }) => memory);
+}
