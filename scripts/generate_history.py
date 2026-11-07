@@ -128,12 +128,15 @@ def render_log(sc, rng, vars, ts, run_id, try_number, stack_variation, llm_lines
             earlier = ts - timedelta(seconds=(len(picked) - k) * rng.randint(1, 4))
             lines.append(fill(l, {**v, "ts": earlier.strftime("%Y-%m-%d %H:%M:%S,") + f"{rng.randint(0, 999):03d}"}))
     lines += [
+        fill(f"[{{ts}}] INFO - Starting attempt {{try_number}} of 3", v),
+        fill(f"[{{ts}}] INFO - Executing <Task(PythonOperator): {sc['task_id']}>", v),
+        fill("[{ts}] INFO - rows_read={rows} host={host} pid={pid}", v),
         fill(f"[{{ts}}] ERROR - Task failed: {sc['dag_id']}.{sc['task_id']} (run_id={{run_id}}, try={{try_number}})", v),
         "Traceback (most recent call last):",
         render_frames(sc, rng, vars, stack_variation),
     ]
     lines += [fill(l, v) for l in sc["error_lines"]]
-    lines.append(fill("rows_read={rows} host={host} pid={pid}", v))
+    lines.append(fill(f"[{{ts}}] INFO - Marking task as FAILED. dag_id={sc['dag_id']}, task_id={sc['task_id']}", v))
     return "\n".join(lines)
 
 
