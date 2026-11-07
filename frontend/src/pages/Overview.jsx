@@ -48,7 +48,7 @@ export default function Overview() {
   return <div>
     <div className="page-heading">
       <div><h1>Overview</h1><p>Your pipeline incident workspace at a glance.</p></div>
-      <div className="heading-actions"><select className="select-field" disabled aria-label="Date range unavailable"><option>Date range unavailable</option></select><span className={`badge ${USE_MOCKS ? "badge-amber" : "badge-blue"}`}>{USE_MOCKS ? "Sample dashboard data" : "Live incident data"}</span></div>
+      <div className="heading-actions"><span className={`badge ${USE_MOCKS ? "badge-amber" : "badge-blue"}`}>{USE_MOCKS ? "Sample dashboard data" : "Live incident data"}</span></div>
     </div>
 
     {loadError && <p className="inline-error" role="alert">Could not load incidents: {loadError}</p>}

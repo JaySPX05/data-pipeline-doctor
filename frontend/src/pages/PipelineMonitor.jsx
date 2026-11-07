@@ -26,7 +26,17 @@ function formatList(value, emptyLabel = "None") {
   }
   if (typeof value === "string") return value || emptyLabel;
   if (isCount(value)) return String(value);
+  if (value && typeof value === "object") {
+    // failing_tasks comes back as { task_id: failure_count }
+    return Object.entries(value).map(([task, n]) => `${task} (${n})`).join(", ") || emptyLabel;
+  }
   return "—";
+}
+
+function taskNames(value) {
+  if (Array.isArray(value)) return value.join(" ");
+  if (value && typeof value === "object") return Object.keys(value).join(" ");
+  return String(value || "");
 }
 
 function formatVerdicts(value) {
@@ -37,7 +47,8 @@ function formatVerdicts(value) {
 
 function formatLastFailure(value) {
   if (!value || typeof value !== "string") return "—";
-  return value.replace("T", " ").replace(/Z$/, " UTC");
+  // API sends naive UTC ("2026-10-28T03:12:45.123456"); show it as UTC to the minute
+  return `${value.replace("T", " ").replace(/(\.\d+)?Z?$/, "").slice(0, 16)} UTC`;
 }
 
 export default function PipelineMonitor() {
@@ -81,7 +92,7 @@ export default function PipelineMonitor() {
   const pipelineRows = Array.isArray(pipelines) ? pipelines : [];
   const visible = useMemo(() => pipelineRows.filter((pipeline) => {
     const taskSearchText = [pipeline.tasks, pipeline.failing_tasks, pipeline.flaky_tasks]
-      .map((tasks) => Array.isArray(tasks) ? tasks.join(" ") : String(tasks || ""))
+      .map(taskNames)
       .join(" ");
     const searchText = `${pipeline.dag_id || ""} ${taskSearchText}`.toLowerCase();
     if (query && !searchText.includes(query.toLowerCase())) return false;
