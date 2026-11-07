@@ -5,6 +5,11 @@ const EXAMPLES = USE_MOCKS
   ? ["Why does load_orders fail?", "Which column was renamed?", "FreshFarm order feed"]
   : ["Why does load_orders fail?", "Which tasks are flaky?", "What did the Payments team change?"];
 
+// kind: tag set at retain time (failure / resolution / correction / change)
+const KIND_BADGE = { correction: "badge-red", resolution: "badge-purple", change: "badge-amber" };
+const memoryKind = (memory) =>
+  (Array.isArray(memory?.tags) ? memory.tags : []).find((tag) => tag.startsWith("kind:"))?.slice(5) || null;
+
 export default function Memory() {
   const [q, setQ] = useState("");
   const [results, setResults] = useState(null);
@@ -94,7 +99,7 @@ export default function Memory() {
         <div id="memory-status" className="muted" role="status" aria-live="polite" style={{ fontSize: 10 }}>{statusMessage}</div>
         {searchError && <p role="alert" style={{ color: "var(--danger)", margin: 0, fontSize: 10 }}>{searchError}</p>}
         <div className="memory-examples"><span className="section-label">Try an example</span><div className="example-list">
-          {EXAMPLES.map((example) => <button type="button" key={example} onClick={() => search(example)} className="example-chip">{example}</button>)}
+          {EXAMPLES.map((example) => <button type="button" key={example} disabled={loading} onClick={() => search(example)} className="example-chip">{example}</button>)}
         </div></div>
       </section>
 
@@ -104,8 +109,9 @@ export default function Memory() {
         {results.length ? <ul className="result-list">{results.map((memory, i) => (
           <li key={memory.memory_id || i} className="result-item">
             <span className="result-type">{memory.type || "memory"}</span>
+            {memoryKind(memory) && <span className={`badge ${KIND_BADGE[memoryKind(memory)] || "badge-blue"}`} style={{ marginRight: 8 }}>{memoryKind(memory)}</span>}
             {memory.occurred_at && <span className="mono muted" style={{ marginRight: 8 }}>{memory.occurred_at.slice(0, 10)}</span>}
-            {memory.text}
+            {memory.text || "No memory text available."}
           </li>
         ))}</ul> : <p className="empty-state">{emptyMessage}</p>}
       </section>}
