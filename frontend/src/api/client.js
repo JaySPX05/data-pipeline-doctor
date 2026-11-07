@@ -42,6 +42,8 @@ export const api = {
       : request(`/api/incidents/${id}/feedback`, { method: "POST", body: JSON.stringify(body) }),
   rediagnose: (id, memory) =>
     USE_MOCKS ? delay(mocks.memoryOffDiagnosis) : request(`/api/incidents/${id}/rediagnose?memory=${memory}`, { method: "POST" }),
+  listPipelines: () => (USE_MOCKS ? delay(null) : request("/api/pipelines")),
+  metricsSummary: () => (USE_MOCKS ? delay(null) : request("/api/metrics/summary")),
   learningCurve: () => (USE_MOCKS ? delay(mocks.learningCurve) : request("/api/metrics/learning-curve")),
   reflect: () => (USE_MOCKS ? delay({ text: mocks.healthBrief }) : request("/api/reflect", { method: "POST", body: "{}" })),
   searchMemory: (q) =>
