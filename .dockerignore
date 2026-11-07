@@ -1,0 +1,18 @@
+# Keep secrets and local state out of every image built from the repo root.
+.env
+.env.*
+!.env.example
+.git
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/node_modules
+frontend/dist
+data/*.sqlite3
+data/generated/eval_results.jsonl
+data/generated/recall_eval.jsonl
+data/generated/memory_outbox_*
+data/generated/health_brief_*
+docker-compose.override.yml

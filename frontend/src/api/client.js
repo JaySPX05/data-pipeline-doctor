@@ -2,7 +2,9 @@
 import * as mocks from "../mocks/incidents.js";
 
 export const USE_MOCKS = import.meta.env.VITE_USE_MOCKS === "true";
-const BASE = import.meta.env.VITE_API_URL || "";
+// Full URL ("https://api.example.com") or, on Render, just the backend's host name.
+const RAW_BASE = (import.meta.env.VITE_API_URL || "").replace(/\/+$/, "");
+const BASE = RAW_BASE && !/^https?:\/\//.test(RAW_BASE) ? `https://${RAW_BASE}` : RAW_BASE;
 
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {

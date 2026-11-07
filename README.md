@@ -87,6 +87,35 @@ Local Hindsight runs its own LLM extraction on every retain, which the Groq and 
 4. Check: http://localhost:8000/api/memory/status shows the Cloud URL, and `cd backend` then `python -m app.memory.smoke` passes.
 5. `python scripts/reset_demo.py --seeded` wipes and re-seeds the bank. It asks you to type the bank name first (`--dry-run` shows what it would do).
 
+## Deploy (Render, free tier)
+
+`render.yaml` deploys the API (Docker, `deploy/backend.Dockerfile`) and the React UI (static site) together.
+
+1. **Seed a separate bank for the hosted demo**, so visitors' clicks never touch the bank the eval uses:
+   `python scripts/seed_memory.py --bank-id quickbasket-demo`
+2. On [render.com](https://render.com), sign in with GitHub, then **New → Blueprint** and pick this repo. Render reads `render.yaml` and asks for `GROQ_API_KEY`, `GEMINI_API_KEY` (optional, leave blank to skip) and `HINDSIGHT_API_KEY`. Click **Apply**.
+3. When both services are live, open `https://pipeline-failure-doctor-api.onrender.com/api/health`. It should show the LLM chain and `api.hindsight.vectorize.io`. If Render gave the API a different hostname because the name was taken, set the static site's `VITE_API_URL` to it and redeploy the static site.
+4. The UI is at `https://pipeline-failure-doctor.onrender.com`.
+
+**Free-tier behaviour:**
+- The API sleeps after 15 minutes idle, so the first request after that takes about a minute.
+- There's no persistent disk, so the incident inbox resets on every restart. Hindsight memory is in the cloud and is kept.
+- Anyone with the URL can trigger diagnoses that use your Groq quota.
+
+**A populated inbox after every restart (optional).** The API copies `data/demo/pfd_demo.sqlite3` in on boot when it has no database. To make that snapshot from a real replay, from the repo root on Windows PowerShell:
+
+```powershell
+$env:HINDSIGHT_BANK_ID = "quickbasket-demo"          # this terminal only: replay into the demo bank
+Remove-Item data\pfd.sqlite3 -ErrorAction SilentlyContinue
+cd backend; uvicorn app.main:app --port 8000          # leave running; open a 2nd terminal at the repo root:
+python scripts/replay.py --from-day 15 --to-day 30 --speed 3600x --max-gap 2 --auto-feedback
+# stop uvicorn (Ctrl+C), then:
+mkdir data\demo; Copy-Item data\pfd.sqlite3 data\demo\pfd_demo.sqlite3
+git add data/demo/pfd_demo.sqlite3; git commit -m "Demo snapshot"; git push
+```
+
+The replay sends 49 failures, so it uses a good part of a day's free Groq quota. Every diagnosis in the snapshot is a real one the agent made.
+
 ## Results: does memory help?
 
 `cd backend` then `python -m app.agent.eval --markdown` diagnoses failures from the replay window (days 15–30) twice, with and without memory, against a bank seeded with days 1–14, and scores each answer against P3's ground truth. It measures verdict accuracy, whether known failures were recognised, root-cause match, and correct page/don't-page decisions. It is read-only, so runs are repeatable. Raw results go to `data/generated/eval_results.jsonl`, with the guardrails that fired and the memories cited for each answer. Misses also print them. `--scenario S09` runs every scenario whose id starts with S09.
