@@ -5,9 +5,9 @@ Retains, per incident: the failure event + (confirmed resolution OR flaky retry 
 plus every change-feed event in the window. Each retain has context, timestamp, document_id,
 metadata and tags (dag:, task:, fp:, kind:). Idempotent: re-running updates the same documents.
 
-  python scripts/seed_memory.py --dry-run          # print what would be retained
-  python scripts/seed_memory.py                    # seed days 1-14
-    python scripts/seed_memory.py --workers 1        # default; more workers hit an aiohttp timeout error
+python scripts/seed_memory.py --dry-run          # print what would be retained
+python scripts/seed_memory.py                    # seed days 1-14
+python scripts/seed_memory.py --workers 1        # default; more workers hit an aiohttp timeout error
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def retain_one(client, bank_id: str, it: dict) -> None:
 
 
 def run(day_from=C.SEED_DAYS[0], day_to=C.SEED_DAYS[1], bank_id=C.BANK_ID, base_url=None,
-        api_key=None, workers=4, dry_run=False) -> int:
+        api_key=None, workers=1, dry_run=False) -> int:
     items = build_items(day_from, day_to)
     kinds = {}
     for it in items:
