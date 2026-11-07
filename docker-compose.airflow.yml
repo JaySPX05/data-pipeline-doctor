@@ -1,0 +1,21 @@
+# Optional: real Airflow that calls Pipeline Failure Doctor on failure. Owner: P7.
+# Run:  docker compose -f docker-compose.yml -f docker-compose.airflow.yml up --build -d
+# UI:   http://localhost:8080   (login printed in: docker compose logs airflow)
+#
+# Mounts the whole integrations/airflow folder as the DAGs folder, so it must contain
+# example_dag.py and failure_callback.py (Jay's files) side by side.
+services:
+  airflow:
+    image: apache/airflow:2.9.3
+    command: standalone
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      PYTHONPATH: /opt/airflow/dags
+      PFD_URL: http://backend:8000
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./integrations/airflow:/opt/airflow/dags
+    depends_on:
+      - backend
