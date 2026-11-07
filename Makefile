@@ -52,16 +52,15 @@ frontend:         ## run the UI on :5173
 	cd frontend && npm run dev
 	
 data:             ## generate 30 days of failures + change feed
-	python scripts/generate_history.py --start 2026-10-01 --seed 42
+	python scripts/generate_history.py --seed 42
 	
 seed-local:       ## same as seed, but run on your machine (backend running locally)
-	python scripts/seed_memory.py --until-day 14
+	python scripts/seed_memory.py --from-day 1 --to-day 14
 	
 replay-local:     ## same as replay, but run on your machine
-	python scripts/replay.py --from-day 15 --to-day 30 --delay 2 --auto-feedback
+	python scripts/replay.py --from-day 15 --to-day 30 --speed 60x --max-gap 3 --auto-feedback
 	
 reset-local:      ## same as reset, but run on your machine (wipes incidents + Hindsight bank)
-	python scripts/reset_demo.py --memory
+	python scripts/reset_demo.py --seeded
 	
 demo: data reset  ## full demo prep (Docker stack): generate data, reset + re-seed; then run `make replay`
- 

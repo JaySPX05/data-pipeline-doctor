@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """End-to-end loop check: failure -> diagnosis card -> feedback -> memory -> reflect.
  
