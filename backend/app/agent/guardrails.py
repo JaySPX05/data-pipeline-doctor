@@ -78,11 +78,18 @@ def apply_guardrails(
         diagnosis.verdict = Verdict.NEW
         diagnosis.confidence = min(diagnosis.confidence, NO_EVIDENCE_MAX_CONFIDENCE)
 
-    # 1b. "Known issue" whose every past outcome was "passed on retry" is flaky: nobody ever fixed it.
-    if diagnosis.verdict == Verdict.KNOWN_ISSUE and not corrections_for(incident, evidence):
-        outcomes = [e for e in history if e.kind() == "resolution" or is_retry_outcome(e)]
+    # 1b. A failure whose every past outcome was "passed on retry" is flaky: nobody ever fixed it.
+    #     KNOWN_ISSUE may lean on task history; NEW needs this exact fingerprint, so a genuinely
+    #     new error on a usually-flaky task stays NEW.
+    if diagnosis.verdict in (Verdict.KNOWN_ISSUE, Verdict.NEW) and not corrections_for(incident, evidence):
+        pool = history if diagnosis.verdict == Verdict.KNOWN_ISSUE else [e for e in evidence if matches_fingerprint(e, incident)]
+        outcomes = [e for e in pool if e.kind() == "resolution" or is_retry_outcome(e)]
         if outcomes and all(is_retry_outcome(e) for e in outcomes):
-            notes.append(f"KNOWN_ISSUE but all {len(outcomes)} past outcome(s) passed on retry: verdict set to FLAKY")
+            notes.append(
+                f"{diagnosis.verdict.value} but all {len(outcomes)} past outcome(s) passed on retry: verdict set to FLAKY"
+            )
+            if diagnosis.verdict == Verdict.NEW:  # it was never new: memory has seen it pass on retry
+                diagnosis.confidence = max(diagnosis.confidence, FLAKY_NO_PAGE_MIN_CONFIDENCE)
             diagnosis.verdict = Verdict.FLAKY
 
     # 2. "Upstream change" needs a change we can point to: in the feed, from the scheduler, or a
