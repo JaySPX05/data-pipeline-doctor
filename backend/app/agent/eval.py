@@ -27,7 +27,7 @@ import re
 import sys
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from app.agent.doctor import FailureDoctor
@@ -66,6 +66,8 @@ class CaseResult:
     latency_ms: int
     providers: str
     fallback: str | None
+    guardrails: list[str] = field(default_factory=list)  # which rules fired and why
+    evidence_seen: list[str] = field(default_factory=list)  # "kind | tags | text" per cited memory
 
 
 def score(record: dict, diagnosis, trace, memory: bool) -> CaseResult:
@@ -91,11 +93,17 @@ def score(record: dict, diagnosis, trace, memory: bool) -> CaseResult:
         latency_ms=diagnosis.latency_ms,
         providers=",".join(sorted({f"{c['provider']}/{c['model']}" for c in trace.llm_calls})) or "none",
         fallback=trace.fallback,
+        guardrails=list(trace.guardrails),
+        evidence_seen=[
+            f"{e.kind() or e.type or '?'} | {','.join(e.tags[:4])} | {e.text[:140]}" for e in diagnosis.evidence[:5]
+        ],
     )
 
 
 def pick_records(from_day: int, scenario: str | None, limit: int) -> list[dict]:
-    rows = demo_data.load_records(from_day=from_day, scenario=scenario)
+    rows = demo_data.load_records(from_day=from_day)
+    if scenario:  # exact id or name, or an id prefix: "S09" matches S09c, S09d, S09e
+        rows = [r for r in rows if r["scenario_id"].startswith(scenario) or r.get("scenario_name") == scenario]
     per: dict[str, int] = defaultdict(int)
     picked = []
     for r in rows:
@@ -121,6 +129,11 @@ def run_eval(doctor: FailureDoctor, records: list[dict], modes: list[bool], dela
                     f"evidence={res.evidence} {res.latency_ms}ms"
                     + (f"  [{res.fallback}]" if res.fallback else "")
                 )
+                if not res.correct:  # say why, so a miss can be fixed without guessing
+                    for note in res.guardrails:
+                        log(f"        guardrail: {note}")
+                    for ev in res.evidence_seen[:3]:
+                        log(f"        evidence:  {ev}")
                 if delay:
                     time.sleep(delay)
     return results

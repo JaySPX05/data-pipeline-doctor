@@ -321,3 +321,20 @@ def test_pagination_past_the_end_is_empty_with_the_real_total(client):
     client.post("/api/failures", json=failure())
     r = client.get("/api/incidents?limit=10&offset=50")
     assert r.status_code == 200 and r.json() == [] and r.headers["x-total-count"] == "1"
+
+
+def test_new_with_an_exact_retry_only_history_is_flaky():
+    # S08 re-run: the model said NEW at 0.45 although this fingerprint passed on retry before
+    d = diag(Verdict.NEW, 0.45, page=True)
+    notes = apply_guardrails(d, incident(), [RETRY, RETRY.model_copy()])
+    assert d.verdict == Verdict.FLAKY and d.confidence == 0.8 and d.page_oncall is False
+    assert any("NEW but all 2 past outcome(s)" in n for n in notes)
+
+
+def test_new_error_on_a_usually_flaky_task_stays_new():
+    # same task, different fingerprint: a genuinely new failure must still page
+    other_fp = ev("load_orders failed with TimeoutError and passed on retry 1.",
+                  ["task:orders_etl.load_orders", "fp:fp_99999999", "kind:resolution", "outcome:auto_retry"])
+    d = diag(Verdict.NEW, 0.45)
+    apply_guardrails(d, incident(), [other_fp])
+    assert d.verdict == Verdict.NEW and d.page_oncall is True
