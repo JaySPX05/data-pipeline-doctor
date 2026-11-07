@@ -44,8 +44,6 @@ FILLER = [
     "[{ts}] INFO - Dependencies all met for task {dag}.{task}",
     "[{ts}] INFO - Executing task on host {host}",
     "[{ts}] INFO - Using connection {conn}",
-    "[{ts}] INFO - Starting attempt {try_number} of {max_tries}",
-    "[{ts}] WARNING - Task retry policy: retries=2 delay=300s",
 ]
 DEFAULT_VARS = {
     "rows": {"type": "int", "range": [10000, 90000]},
@@ -123,9 +121,10 @@ def render_log(sc, rng, vars, ts, run_id, try_number, stack_variation, llm_lines
         lines = list(llm_lines)
     else:   # filler lines get earlier timestamps than the ERROR line
         picked = rng.sample(FILLER, rng.randint(2, 3))
+        step = rng.randint(1, 4)   # one gap per log, so times always increase
         lines = []
         for k, l in enumerate(picked):
-            earlier = ts - timedelta(seconds=(len(picked) - k) * rng.randint(1, 4))
+            earlier = ts - timedelta(seconds=(len(picked) - k) * step)
             lines.append(fill(l, {**v, "ts": earlier.strftime("%Y-%m-%d %H:%M:%S,") + f"{rng.randint(0, 999):03d}"}))
     lines += [
         fill(f"[{{ts}}] INFO - Starting attempt {{try_number}} of 3", v),
