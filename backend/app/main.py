@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import failures, incidents, memory, metrics
+from app.api import failures, incidents, memory, metrics, pipelines
 from app.config import settings
 from app.db.database import init_db
 from app.deps import get_llm, get_store
@@ -32,7 +32,7 @@ app.add_middleware(
     expose_headers=["X-Total-Count", "Server-Timing"],
 )
 
-for router in (failures.router, incidents.router, memory.router, metrics.router):
+for router in (failures.router, incidents.router, memory.router, metrics.router, pipelines.router):
     app.include_router(router)
 
 
