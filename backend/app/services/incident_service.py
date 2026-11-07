@@ -1,8 +1,9 @@
 """Incident persistence (SQLite) and metrics. Owner: P1 (Jay)."""
 import uuid
 from collections import defaultdict
+from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db.tables import IncidentRow
@@ -18,6 +19,11 @@ from app.models.schemas import (
 from app.services.fingerprint import fingerprint
 
 AUTO_DIAGNOSED_MIN_CONFIDENCE = 0.7
+
+
+def to_utc_naive(dt: datetime) -> datetime:
+    """Store every timestamp as naive UTC so SQLite ordering, day grouping and windows agree."""
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
 def to_model(row: IncidentRow) -> Incident:
@@ -47,7 +53,7 @@ def create_incident(session: Session, event: FailureEvent) -> Incident:
         task_id=event.task_id,
         run_id=event.run_id,
         try_number=event.try_number,
-        occurred_at=event.occurred_at,
+        occurred_at=to_utc_naive(event.occurred_at),
         error_class=error_class,
         error_message=message,
         fingerprint=fp,
@@ -70,17 +76,38 @@ def list_incidents(
     status: str | None = None,
     verdict: str | None = None,
     dag_id: str | None = None,
+    q: str | None = None,
     limit: int = 200,
-) -> list[Incident]:
-    stmt = select(IncidentRow).order_by(IncidentRow.occurred_at.desc()).limit(limit)
+    offset: int = 0,
+) -> tuple[list[Incident], int]:
+    """Newest first. Returns (page, total matching) so the UI can paginate."""
+    filters = []
     if status:
-        stmt = stmt.where(IncidentRow.status == status)
+        filters.append(IncidentRow.status == status)
     if dag_id:
-        stmt = stmt.where(IncidentRow.dag_id == dag_id)
-    items = [to_model(r) for r in session.scalars(stmt)]
+        filters.append(IncidentRow.dag_id == dag_id)
     if verdict:
-        items = [i for i in items if i.diagnosis and i.diagnosis.verdict.value == verdict]
-    return items
+        filters.append(IncidentRow.diagnosis["verdict"].as_string() == verdict)
+    if q:
+        like = f"%{q.strip()}%"
+        filters.append(
+            or_(
+                IncidentRow.dag_id.ilike(like),
+                IncidentRow.task_id.ilike(like),
+                IncidentRow.error_class.ilike(like),
+                IncidentRow.error_message.ilike(like),
+                IncidentRow.fingerprint.ilike(like),
+            )
+        )
+    total = session.scalar(select(func.count()).select_from(IncidentRow).where(*filters)) or 0
+    stmt = (
+        select(IncidentRow)
+        .where(*filters)
+        .order_by(IncidentRow.occurred_at.desc(), IncidentRow.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return [to_model(r) for r in session.scalars(stmt)], total
 
 
 def save_diagnosis(session: Session, incident_id: str, diagnosis: Diagnosis) -> Incident:
@@ -133,3 +160,61 @@ def learning_curve(session: Session) -> list[LearningCurvePoint]:
             )
         )
     return points
+
+
+def metrics_summary(session: Session) -> dict:
+    """Totals for the Insights KPI tiles. Shape matches api.metrics.MetricsSummary."""
+    incidents = [to_model(r) for r in session.scalars(select(IncidentRow).order_by(IncidentRow.occurred_at))]
+    diagnosed = [i for i in incidents if i.diagnosis]
+    reviewed = [i for i in incidents if i.feedback]
+    timed = [i for i in reviewed if i.feedback.minutes_to_fix is not None]
+
+    by_verdict: dict[str, int] = defaultdict(int)
+    for i in diagnosed:
+        by_verdict[i.diagnosis.verdict.value] += 1
+
+    auto = [
+        i for i in diagnosed
+        if i.diagnosis.verdict != Verdict.NEW and i.diagnosis.confidence >= AUTO_DIAGNOSED_MIN_CONFIDENCE
+    ]
+
+    mttr_days: dict[str, list[int]] = defaultdict(list)
+    for i in timed:
+        mttr_days[i.occurred_at.date().isoformat()].append(i.feedback.minutes_to_fix)
+    mttr_by_day = [
+        {"day": day, "resolved": len(mins), "mttr_minutes": round(sum(mins) / len(mins), 1)}
+        for day, mins in sorted(mttr_days.items())
+    ]
+    mttr_lookup = {d["day"]: d["mttr_minutes"] for d in mttr_by_day}
+
+    curve = learning_curve(session)
+
+    def snapshot(point: LearningCurvePoint | None) -> dict | None:
+        if point is None:
+            return None
+        return {
+            "day": point.day,
+            "auto_diagnosed_pct": point.auto_diagnosed_pct,
+            "accuracy_pct": point.accuracy_pct,
+            "mttr_minutes": mttr_lookup.get(point.day),
+        }
+
+    def pct(part: int, whole: int) -> float:
+        return round(100 * part / whole, 1) if whole else 0.0
+
+    return {
+        "total_incidents": len(incidents),
+        "diagnosed": len(diagnosed),
+        "resolved": len(reviewed),
+        "by_verdict": dict(by_verdict),
+        "auto_diagnosed_pct": pct(len(auto), len(diagnosed)),
+        "accuracy_pct": pct(sum(i.feedback.correct for i in reviewed), len(reviewed)) if reviewed else None,
+        "pages_avoided": sum(
+            1 for i in diagnosed if i.diagnosis.verdict == Verdict.FLAKY and not i.diagnosis.page_oncall
+        ),
+        "avg_latency_ms": round(sum(i.diagnosis.latency_ms for i in diagnosed) / len(diagnosed), 1) if diagnosed else 0.0,
+        "mttr_minutes": round(sum(i.feedback.minutes_to_fix for i in timed) / len(timed), 1) if timed else None,
+        "mttr_by_day": mttr_by_day,
+        "first_day": snapshot(curve[0] if curve else None),
+        "latest_day": snapshot(curve[-1] if curve else None),
+    }

@@ -13,15 +13,19 @@ _NOISE: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b0x[0-9a-f]+\b", re.I), "<HEX>"),
     (re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{12,}\b", re.I), "<HASH>"),
     (re.compile(r"\b(?:ip|host|worker|executor)-[\w.-]+", re.I), "<HOST>"),
+    (re.compile(r"\bo\d+(?=\.)"), "o<N>"),  # py4j JVM object ids: "calling o697.save"
     (re.compile(r"(?:/[\w.\-]+)+\.(?:py|scala|java|sql)"), "<PATH>"),
     (re.compile(r"\b\d+(?:\.\d+)?\b"), "<N>"),
     (re.compile(r"\s+"), " "),
 ]
 
 # e.g. "KeyError: 'customer_id'", "botocore.exceptions.ClientError: ... ExpiredToken",
-#      "java.lang.OutOfMemoryError: Java heap space", "kafka.errors.KafkaTimeoutError: ..."
+#      "java.lang.OutOfMemoryError: Java heap space", "kafka.errors.KafkaTimeoutError: ...",
+#      "Caused by: java.sql.SQLException: ..." (Java cause chains),
+#      ": java.lang.OutOfMemoryError: Java heap space" (py4j prints the JVM cause on its own line)
+# We scan from the bottom, so the deepest cause wins over its wrapper (Py4JJavaError, etc.).
 _ERROR_LINE = re.compile(
-    r"^\s*(?:\[[^\]]*\]\s*)?(?:ERROR\s*-?\s*)?"
+    r"^\s*(?:\[[^\]]*\]\s*)?(?:ERROR\s*-?\s*)?(?:Caused by:\s*|:\s+)?"
     r"(?P<cls>[A-Za-z_][\w.]*(?:Error|Exception|Timeout|Exhausted|Failure|Failed))\b:?\s*(?P<msg>.*)$"
 )
 

@@ -1,12 +1,9 @@
+import { useEffect, useRef, useState } from "react";
+import { api, USE_MOCKS } from "../api/client.js";
 
-import { useState } from "react";
-import { api } from "../api/client.js";
-
-const EXAMPLES = [
-  "Why does load_orders fail?",
-  "Which tasks are flaky?",
-  "What did the Payments team change?"
-];
+const EXAMPLES = USE_MOCKS
+  ? ["Why does load_orders fail?", "Which column was renamed?", "FreshFarm order feed"]
+  : ["Why does load_orders fail?", "Which tasks are flaky?", "What did the Payments team change?"];
 
 export default function Memory() {
   const [q, setQ] = useState("");
@@ -37,6 +34,28 @@ export default function Memory() {
       setLoading(false);
     }
   };
+
+  const statusMessage = USE_MOCKS
+    ? "Mock mode is on. Results are sample data from the frontend; no learned memory service is queried."
+    : statusLoading
+      ? "Checking memory service status…"
+      : statusError
+        ? statusError
+        : memoryStatus?.enabled === false
+          ? "Memory is disabled in the backend. Enable MEMORY_ENABLED to use Hindsight recall."
+          : memoryStatus?.last_error
+            ? "Hindsight reported a recall error. Check that the configured service and bank are available; details are in the backend logs."
+            : memoryStatus?.enabled
+              ? "Memory is enabled. Service errors are checked again after each recall."
+              : "Memory service status is unavailable.";
+
+  const emptyMessage = USE_MOCKS
+    ? "No sample memories match this query. Try another keyword; mock mode contains only the bundled examples."
+    : memoryStatus?.enabled === false
+      ? "Memory is disabled in the backend, so no learned memories can be recalled."
+      : memoryStatus?.last_error
+        ? "Hindsight could not complete recall. Check the memory service status and backend logs."
+        : "No memories matched this query in the configured Hindsight bank. Only memories already retained in that bank can be found.";
 
   return (
     <div className="space-y-5">

@@ -222,3 +222,14 @@ def test_contradicting_a_correction_is_penalised(incident):
     right = _dx(root_cause="Expired S3 credential after IAM key rotation", suggested_fix="Refresh aws_inventory connection")
     apply_guardrails(right, incident, [RESOLUTION, correction])
     assert right.confidence == 0.9
+
+
+def test_tool_call_signature_survives_into_next_turn(incident, session):
+    from types import SimpleNamespace
+
+    signed_call = tool_call("grep_log", {"pattern": "KeyError"})
+    signed_call.extra_content = {"google": {"thought_signature": "sig=="}}
+    llm = ScriptedLLM(reply(tool_calls=[signed_call]), reply(diagnosis_json()))
+    FailureDoctor(store=FakeStore([RESOLUTION]), llm=llm).diagnose(incident, session)
+    assistant = [m for m in llm.requests[1]["messages"] if m.get("tool_calls")][0]
+    assert assistant["tool_calls"][0]["extra_content"] == {"google": {"thought_signature": "sig=="}}

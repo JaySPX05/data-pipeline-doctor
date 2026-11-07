@@ -1,0 +1,20 @@
+# S02: flaky Kafka consumer timeout. Passes on retry. Demo: FLAKY + "don't page".
+id: S02
+name: kafka_consumer_timeout
+dag_id: events_ingest
+task_id: pull_kafka
+verdict: FLAKY
+error_class: KafkaTimeoutError
+error_lines:
+  - "kafka.errors.KafkaTimeoutError: Failed to update metadata after 60.0 secs."
+core_frames:
+  - {file: "{path}/pull_kafka.py", fn: run, code: "records = consumer.poll(timeout_ms=60000)"}
+  - {file: "/home/airflow/.local/lib/python3.11/site-packages/kafka/consumer/group.py", fn: poll, code: "records = self._poll_once(timer, max_records)"}
+root_cause: "Transient consumer-group rebalance on the events.clickstream topic; broker metadata timed out. Passes on retry."
+fix: "No fix needed: auto-retry passed. Consider raising session.timeout.ms if frequency keeps growing."
+minutes_to_resolve: {base: 1, jitter: 0}
+auto_retry_passes: true
+retry_count: 1
+schedule:
+  random: {count: 40}          # plan says ~2/week; 40 = bumped to hit the ~100-120 total. Ask Jay.
+  hour_range: [0, 23]

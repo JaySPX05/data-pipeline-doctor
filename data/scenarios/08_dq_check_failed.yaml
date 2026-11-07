@@ -1,0 +1,22 @@
+# S08: data-quality check fails in the mornings because the warehouse sync lags. Flaky.
+id: S08
+name: dq_check_failed
+dag_id: inventory_sync
+task_id: dq_checks
+verdict: FLAKY
+error_class: AssertionError
+error_lines:
+  - "AssertionError: Great Expectations validation failed: expect_column_values_to_not_be_null on column 'sku_id' ({pct} percent unexpected)"
+core_frames:
+  - {file: "{path}/dq_checks.py", fn: run, code: "assert result.success, format_failure(result)"}
+  - {file: "{path}/dq_checks.py", fn: validate, code: "result = validator.expect_column_values_to_not_be_null('sku_id')"}
+root_cause: "Warehouse sync lag: inventory table was not fully populated when the check ran. Passes after retry."
+fix: "No fix needed: auto-retry passed once the warehouse sync caught up."
+minutes_to_resolve: {base: 2, jitter: 0}
+auto_retry_passes: true
+retry_count: 1
+schedule:
+  random: {count: 24}
+  hour_range: [5, 10]           # mornings
+variables:
+  pct: {type: float, range: [1.0, 9.0]}

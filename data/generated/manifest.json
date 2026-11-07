@@ -1,0 +1,51 @@
+{
+  "seed": 42,
+  "llm": false,
+  "stack_variation": true,
+  "fingerprinter": "backend:services/fingerprint.py",
+  "start_date": "2026-10-01",
+  "total_incidents": 99,
+  "total_changes": 24,
+  "seed_window_incidents": 50,
+  "replay_window_incidents": 49,
+  "by_scenario": {
+    "S01": 4,
+    "S02": 40,
+    "S03": 4,
+    "S04": 4,
+    "S05": 3,
+    "S06": 12,
+    "S07": 3,
+    "S08": 24,
+    "S09a": 1,
+    "S09b": 1,
+    "S09c": 1,
+    "S09d": 1,
+    "S09e": 1
+  },
+  "by_scenario_seed_window": {
+    "S01": 2,
+    "S02": 22,
+    "S03": 1,
+    "S04": 2,
+    "S06": 5,
+    "S07": 2,
+    "S08": 14,
+    "S09a": 1,
+    "S09b": 1
+  },
+  "by_scenario_replay_window": {
+    "S01": 2,
+    "S02": 18,
+    "S03": 3,
+    "S04": 2,
+    "S05": 3,
+    "S06": 7,
+    "S07": 1,
+    "S08": 10,
+    "S09c": 1,
+    "S09d": 1,
+    "S09e": 1
+  },
+  "distinct_fingerprints": 13
+}

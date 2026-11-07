@@ -1,0 +1,9 @@
+# QuickBasket: fictional quick-commerce startup, Bengaluru. 6 DAGs, 25 tasks.
+company: QuickBasket
+dags:
+  orders_etl: [extract_pg, validate_feed, load_orders, load_returns, publish_orders]
+  payments_daily: [extract_payments, aggregate, reconcile, publish_ledger]
+  events_ingest: [pull_kafka, parse_events, dedupe_events, write_lake]
+  inventory_sync: [pull_inventory, dq_checks, export_s3, notify_ops]
+  marketing_attribution: [load_campaigns, join_spend, attribute_touchpoints, publish_roi]
+  customer_360: [extract_cdc, enrich_geo, merge_profiles, publish_profiles]

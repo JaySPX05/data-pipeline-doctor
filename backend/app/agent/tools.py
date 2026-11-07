@@ -37,26 +37,79 @@ def _naive_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
-def changes_for_incident(incident: Incident, hours_back: int = 72, keyword: str | None = None, limit: int = 10) -> list[dict]:
-    """Changes in the window before the failure that affect this DAG (or match any keyword word).
 
-    Matching on the DAG is what makes this reliable: the model's keyword guesses often miss
-    (e.g. it searches 'aws_inventory' but the event says 'svc-inventory-export').
-    """
+def changes_for_incident(
+    incident: Incident,
+    hours_back: int = 72,
+    keyword: str | None = None,
+    limit: int = 10
+) -> list[dict]:
+    """Find changes before a failure that affect its DAG or task."""
+
     end = _naive_utc(incident.occurred_at)
     start = end - timedelta(hours=hours_back)
-    words = [w for w in re.split(r"[^a-z0-9]+", (keyword or "").lower()) if len(w) > 2]
+
+    words = [
+        w for w in re.split(r"[^a-z0-9]+", (keyword or "").lower())
+        if len(w) > 2
+    ]
+
     items = []
+
     for change in _load_change_feed():
-        at = _naive_utc(datetime.fromisoformat(change["at"]))
+
+        # Support both old and generated change-feed formats
+        time_value = change.get("at") or change.get("ts")
+        if not time_value:
+            continue
+
+        at = _naive_utc(datetime.fromisoformat(time_value))
+
         if not (start <= at <= end):
             continue
-        affects = change.get("affects_dags") or []
-        text = change["text"].lower()
-        if incident.dag_id in affects or not affects or any(w in text for w in words):
-            items.append({**change, "hours_before_failure": round((end - at).total_seconds() / 3600, 1)})
+
+        # Support both old and generated field names
+        affects = (
+            change.get("affects_dags")
+            or change.get("affects")
+            or []
+        )
+
+        change_text = (
+            change.get("text")
+            or change.get("summary")
+            or ""
+        )
+
+        change_text_lower = change_text.lower()
+
+        # Match either DAG-level or task-level affected entries
+        incident_task = f"{incident.dag_id}.{incident.task_id}"
+
+        matches_dag = (
+            incident.dag_id in affects
+            or incident_task in affects
+        )
+
+        matches_keyword = any(
+            word in change_text_lower for word in words
+        )
+
+        if matches_dag or not affects or matches_keyword:
+            items.append({
+                **change,
+                "at": time_value,
+                "text": change_text,
+                "affects_dags": affects,
+                "hours_before_failure": round(
+                    (end - at).total_seconds() / 3600, 1
+                )
+            })
+
     items.sort(key=lambda c: c["hours_before_failure"])
+
     return items[:limit]
+
 
 
 def get_change_feed(ctx: ToolContext, hours_back: int = 72, keyword: str | None = None) -> dict:
