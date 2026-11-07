@@ -106,7 +106,8 @@ Local Hindsight runs its own LLM extraction on every retain, which the Groq and 
 - **The 3 misses with memory on led to two guardrail fixes** (`backend/app/agent/guardrails.py`, rules 1b and 2):
   - S08: every past `dq_checks` failure had passed on retry, but the model called it KNOWN_ISSUE. Now a "known issue" whose past outcomes were all "passed on retry" is FLAKY, and so doesn't page.
   - S09c: a same-DAG change from 7.7 days earlier counted as evidence for UPSTREAM_CHANGE. Only changes from the 72 h before a failure count now, and an upstream change with none is downgraded to NEW.
-  - The table above is from before these fixes. Re-run `--scenario S08` and `--scenario S09c` to see the effect.
+  - **Re-run of the missed scenarios after the fixes:** S08 went 0% → 100% with memory on (FLAKY both times, no page), and S09c went 0% → 100% (NEW). S09d and S09e stayed correct. In both S08 runs the model itself still said NEW. The guardrail saw this exact fingerprint pass on retry in memory and corrected the verdict, which is why the rules live in code and not in the prompt.
+  - The full table above is from the run before the fixes. Every scenario that missed is now right in a targeted re-run, but the headline stays 83.3% until a full re-run (`python -m app.agent.eval --markdown`) confirms it.
 
 ## Groq free tier
 
