@@ -33,3 +33,18 @@ jobs:
       - run: npm run build
         env:
           VITE_USE_MOCKS: "true"
+
+  banned-word:
+    # Content that mentions the word is disqualified, so keep it out of the repo too.
+    # The two docs that state the rule are the only allowed mentions.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No "hackathon" outside the rule docs
+        run: |
+          if git grep -n -i -I "hackathon" -- . \
+               ':!docs/CONTENT_CHECKLIST.md' ':!docs/AI_PROMPTS.md' ':!.github/workflows/ci.yml'; then
+            echo "::error::Remove the word above. Content mentioning it is disqualified."
+            exit 1
+          fi
+          echo "clean"

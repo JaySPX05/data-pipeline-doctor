@@ -37,4 +37,4 @@ Pick your own angle so the 7 articles don't overlap:
 ## Video (team, 2-5 min, P7)
 
 - [ ] Follows the demo script in the project plan: hook → memory OFF → memory ON → live replay → correction → Health Brief
-- [ ] Shows the Hindsight UI (:9999) with the memory bank at least once
+- [ ] Shows the memory bank in the Hindsight UI at least once (Cloud: ui.hindsight.vectorize.io → bank `quickbasket-data-platform`; local Docker: http://localhost:9999)
