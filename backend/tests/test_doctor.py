@@ -200,7 +200,7 @@ def test_confidence_capped_without_fingerprint_match(incident):
 def test_upstream_change_needs_a_change(incident):
     dx = _dx(verdict=Verdict.UPSTREAM_CHANGE, confidence=0.9)
     apply_guardrails(dx, incident, [])
-    assert dx.confidence == 0.6
+    assert dx.verdict == Verdict.NEW and dx.confidence == 0.5
 
     dx2 = _dx(verdict=Verdict.UPSTREAM_CHANGE, confidence=0.9)
     apply_guardrails(dx2, incident, [], change_seen=True)

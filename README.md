@@ -74,7 +74,39 @@ Local Hindsight runs its own LLM extraction on every retain, which the Groq and 
 
 `cd backend` then `python -m app.agent.eval --markdown` diagnoses failures from the replay window (days 15–30) twice, with and without memory, against a bank seeded with days 1–14, and scores each answer against P3's ground truth. It measures verdict accuracy, whether known failures were recognised, root-cause match, and correct page/don't-page decisions. It is read-only, so runs are repeatable. Raw results go to `data/generated/eval_results.jsonl`.
 
-_Paste the eval's markdown table here after a run on the seeded bank._
+**With memory on, verdict accuracy goes from 38.9% to 83.3%, and every repeat failure is recognised (46.7% → 100%).** This is a run on Hindsight Cloud on 2026-11-07: 18 failures from the replay window, 2 per scenario, against a bank seeded with days 1–14 (112 memories).
+
+| Metric | Memory OFF | Memory ON |
+| --- | --- | --- |
+| Verdict accuracy | 38.9% | 83.3% |
+| Known failures recognised | 46.7% | 100% |
+| Root cause matches the real one | 55.6% | 55.6% |
+| Correct page / don't-page decision | 77.8% | 88.9% |
+| Average confidence | 0.69 | 0.90 |
+| Memories cited per diagnosis | 0 | 2.7 |
+
+| Scenario | Truth | Accuracy OFF | Accuracy ON |
+| --- | --- | --- | --- |
+| S01 vendor_schema_change | UPSTREAM_CHANGE | 100% | 100% |
+| S02 kafka_consumer_timeout | FLAKY | 0% | 100% |
+| S03 spark_oom_month_end | KNOWN_ISSUE | 0% | 100% |
+| S04 expired_s3_credentials | KNOWN_ISSUE | 0% | 100% |
+| S05 upstream_table_dropped_column | UPSTREAM_CHANGE | 100% | 100% |
+| S06 duplicate_primary_key | KNOWN_ISSUE | 0% | 100% |
+| S07 postgres_pool_exhausted | KNOWN_ISSUE | 0% | 100% |
+| S08 dq_check_failed | FLAKY | 0% | 0% |
+| S09c wildcard_locale_number_format | NEW | 100% | 0% |
+| S09d wildcard_volume_permissions | NEW | 100% | 100% |
+| S09e wildcard_redis_failover | NEW | 100% | 100% |
+
+**What the numbers say, honestly:**
+- Memory turns every known issue from "NEW, page a human" into the right verdict. The 5 scenarios that went 0% → 100% are the failures the team had already solved.
+- Root-cause match didn't move (55.6%). The scorer wants 40% of the ground truth's key words, and the agent often describes the right cause in its own words. Treat it as a lower bound.
+- Memory ON is slower (12.4 s vs 6.8 s per diagnosis) because of three recall queries plus Groq free-tier rate limits. Most calls fell back from `gpt-oss-120b` to the next model in the chain.
+- **The 3 misses with memory on led to two guardrail fixes** (`backend/app/agent/guardrails.py`, rules 1b and 2):
+  - S08: every past `dq_checks` failure had passed on retry, but the model called it KNOWN_ISSUE. Now a "known issue" whose past outcomes were all "passed on retry" is FLAKY, and so doesn't page.
+  - S09c: a same-DAG change from 7.7 days earlier counted as evidence for UPSTREAM_CHANGE. Only changes from the 72 h before a failure count now, and an upstream change with none is downgraded to NEW.
+  - The table above is from before these fixes. Re-run `--scenario S08` and `--scenario S09c` to see the effect.
 
 ## Groq free tier
 

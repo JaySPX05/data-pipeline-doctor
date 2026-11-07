@@ -123,10 +123,73 @@ def test_flaky_just_below_threshold_still_pages():
     assert d.page_oncall is True
 
 
-def test_unsupported_upstream_change_is_capped():
+def test_unsupported_upstream_change_becomes_new():
     d = diag(Verdict.UPSTREAM_CHANGE, 0.9)
-    apply_guardrails(d, incident(), [])
-    assert d.confidence == 0.6
+    notes = apply_guardrails(d, incident(), [])
+    assert d.verdict == Verdict.NEW and d.confidence == 0.5
+    assert any("no recent change" in n for n in notes)
+
+
+def test_a_change_from_weeks_ago_is_not_a_cause():
+    # eval miss S09c: recall surfaced a same-DAG change from 7.7 days earlier
+    old = ev("Deployed orders_etl v2.0", ["kind:change", "dag:orders_etl"], at=datetime(2026, 10, 11, 20, 0))
+    d = diag(Verdict.UPSTREAM_CHANGE, 0.7)
+    apply_guardrails(d, incident(), [old])
+    assert d.verdict == Verdict.NEW
+
+
+def test_a_change_memory_from_the_last_72h_supports_upstream():
+    recent = ev("Vendor feed v2.5 released", ["kind:change", "dag:orders_etl"], at=datetime(2026, 10, 19, 1, 0))
+    d = diag(Verdict.UPSTREAM_CHANGE, 0.9)
+    apply_guardrails(d, incident(), [recent])
+    assert d.verdict == Verdict.UPSTREAM_CHANGE and d.confidence == 0.9
+
+
+def test_a_change_after_the_failure_does_not_count():
+    later = ev("Hotfix deployed", ["kind:change", "dag:orders_etl"], at=datetime(2026, 10, 19, 9, 0))
+    d = diag(Verdict.UPSTREAM_CHANGE, 0.9)
+    apply_guardrails(d, incident(), [later])
+    assert d.verdict == Verdict.NEW
+
+
+RETRY = ev("orders_etl.load_orders failed with KeyError and passed on retry 1.",
+           [f"fp:{FP}", "kind:resolution", "outcome:auto_retry"])
+FIXED = ev("Root cause: vendor rename. Fix: map cust_id. Took 12 min.", [f"fp:{FP}", "kind:resolution"])
+
+
+def test_known_issue_that_only_ever_passed_on_retry_is_flaky_and_does_not_page():
+    # eval miss S08: 14 past dq_checks outcomes, all "passed on retry", called KNOWN_ISSUE
+    d = diag(Verdict.KNOWN_ISSUE, 0.95, page=True)
+    notes = apply_guardrails(d, incident(), [FP_EVIDENCE, RETRY, RETRY.model_copy()])
+    assert d.verdict == Verdict.FLAKY and d.page_oncall is False
+    assert any("passed on retry" in n for n in notes)
+
+
+def test_retry_outcome_is_recognised_from_text_when_tags_are_lost():
+    untagged = ev(f"load_orders ({FP}) failed with KeyError and passed on retry 1. 3rd time this month.")
+    d = diag(Verdict.KNOWN_ISSUE, 0.9)
+    apply_guardrails(d, incident(), [untagged])
+    assert d.verdict == Verdict.FLAKY
+
+
+def test_known_issue_with_a_real_fix_in_history_stays_known():
+    d = diag(Verdict.KNOWN_ISSUE, 0.95)
+    apply_guardrails(d, incident(), [RETRY, FIXED])
+    assert d.verdict == Verdict.KNOWN_ISSUE
+
+
+def test_known_issue_with_no_outcomes_yet_stays_known():
+    d = diag(Verdict.KNOWN_ISSUE, 0.9)
+    apply_guardrails(d, incident(), [FP_EVIDENCE])
+    assert d.verdict == Verdict.KNOWN_ISSUE
+
+
+def test_retry_rule_never_overrides_a_correction():
+    corr = ev("Correction: not flaky, the vendor renamed customer_id to cust_id",
+              [f"fp:{FP}", "kind:correction"], at=datetime(2026, 10, 9))
+    d = diag(Verdict.KNOWN_ISSUE, 0.9, root="vendor renamed customer_id to cust_id")
+    apply_guardrails(d, incident(), [RETRY, corr])
+    assert d.verdict == Verdict.KNOWN_ISSUE
 
 
 def test_upstream_change_backed_by_the_change_feed_is_not_capped_below_095():
