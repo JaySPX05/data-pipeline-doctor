@@ -11,3 +11,4 @@ python-dotenv==1.2.4
 
 # dev / test
 pytest==9.2.0
+requests==2.34.2   # integrations/e2e/e2e_test.py (make e2e)
