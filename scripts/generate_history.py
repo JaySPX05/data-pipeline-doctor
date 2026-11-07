@@ -108,7 +108,10 @@ def render_frames(sc, rng, vars, stack_variation):
     frames = extras + [(f["file"], f["fn"], f["code"]) for f in sc["core_frames"]]
     out = []
     for file, fn, code in frames:
-        out.append(f'  File "{fill(file, vars)}", line {rng.randint(10, 400)}, in {fn}')
+        lineno = rng.randint(10, 400)   # always drawn, so the random stream never shifts
+        if fn in sc.get("exclude_frames", []):
+            continue
+        out.append(f'  File "{fill(file, vars)}", line {lineno}, in {fn}')
         out.append(f"    {code}")
     return "\n".join(out)
 
