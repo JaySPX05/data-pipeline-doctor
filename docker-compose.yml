@@ -2,12 +2,14 @@
 #   cp .env.example .env      (add GROQ_API_KEY)
 #   docker compose up --build
 #
-# Using Hindsight Cloud instead? In .env set:
+# Need a Groq -> Gemini failover for Hindsight's own LLM? See docker-compose.override.example.yml
+#
+# Using Hindsight Cloud instead (team default)? Easiest: make up-cloud. Or by hand, in .env set:
 #   HINDSIGHT_URL_DOCKER=<your cloud URL>
 #   HINDSIGHT_API_KEY=<your key>
 # then run (--no-deps stops Compose from also starting the local hindsight):
 #   docker compose up --build --no-deps backend frontend
-
+ 
 services:
   hindsight:
     image: ghcr.io/vectorize-io/hindsight:latest   # large first pull; start it early on Day 1
@@ -23,7 +25,7 @@ services:
     volumes:
       - hindsight-data:/home/hindsight/.pg0
     restart: unless-stopped
-
+ 
   backend:
     build: ./backend
     ports:
@@ -40,7 +42,7 @@ services:
     depends_on:
       - hindsight
     restart: unless-stopped
-
+ 
   frontend:
     build: ./frontend
     ports:
@@ -53,6 +55,7 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
-
+ 
 volumes:
   hindsight-data:
+ 
