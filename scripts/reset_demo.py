@@ -51,15 +51,29 @@ def main():
     ap.add_argument("--bank-id", default=C.BANK_ID)
     ap.add_argument("--db-path", default=None)
     ap.add_argument("--skip-db", action="store_true")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
+    ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     a = ap.parse_args()
+
+    db = None if a.skip_db else sqlite_path(a.db_path)
+    print(f"Mode:      {'empty' if a.empty else 'seeded'}")
+    print(f"Hindsight: {a.base_url}")
+    print(f"Bank:      {a.bank_id}  (will be DELETED and recreated)")
+    print(f"SQLite:    {db if db else 'untouched'}")
+    if a.dry_run:
+        print("Dry run: nothing was changed.")
+        return
+    if not a.yes:
+        if input(f"Type the bank name '{a.bank_id}' to confirm: ").strip() != a.bank_id:
+            print("Cancelled. Nothing was changed.")
+            return
 
     print("1/3 Hindsight bank")
     delete_bank(a.base_url, a.bank_id, a.api_key)
     C.ensure_bank(C.get_hindsight(a.base_url, a.api_key), a.bank_id)
 
     print("2/3 SQLite incident store")
-    db = None if a.skip_db else sqlite_path(a.db_path)
     if db and db.exists():
         db.unlink()
         print(f"  removed {db}  (restart the backend so it recreates the tables)")
@@ -72,7 +86,6 @@ def main():
     else:
         print("  empty bank: Day 0 baseline ready (memory-off diagnosis)")
     print("Reset complete.")
-
 
 if __name__ == "__main__":
     main()
