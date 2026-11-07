@@ -143,6 +143,12 @@ def doc_of(r) -> str:
     return str(getattr(r, "document_id", None) or "?")
 
 
+def label_of(r) -> str:
+    """document_id, or the fact type plus a text snippet for observations (no document_id)."""
+    doc = getattr(r, "document_id", None)
+    return str(doc) if doc else f"{getattr(r, 'type', '?')}: {(r.text or '')[:50]}"
+
+
 def show(results) -> None:
     if not results:
         print("   (no results)")
@@ -321,7 +327,9 @@ def main() -> int:
         with timed("5. recall, tags=[task], tags_match=any_strict"):
             strict = recall(client, bank_id, tags=[TASK], tags_match="any_strict")
             show(strict)
-        leaks = [doc_of(r) for r in strict if doc_of(r).startswith("smoke-ctrl")]
+        # Judge by tags, not document_id: Hindsight's consolidated "observation" results have no
+        # document_id but do carry the tags of the memories they came from.
+        leaks = [label_of(r) for r in strict if TASK not in (r.tags or [])]
         record("any_strict keeps other tasks + untagged out", bool(strict) and not leaks,
                f"leaked: {leaks}" if leaks else f"{len(strict)} results, no leaks")
 
@@ -329,7 +337,7 @@ def main() -> int:
         with timed("6. recall, tags=[task], tags_match=any  (what hindsight_store.py uses today)"):
             loose = recall(client, bank_id, tags=[TASK], tags_match="any")
             show(loose)
-        loose_leaks = [doc_of(r) for r in loose if doc_of(r).startswith("smoke-ctrl")]
+        loose_leaks = [label_of(r) for r in loose if TASK not in (r.tags or [])]
         record("'any' lets untagged/other memories in", None,
                f"leaked: {loose_leaks}" if loose_leaks else "no leaks this time")
 
@@ -337,7 +345,7 @@ def main() -> int:
         with timed("7. recall, tags=[task, kind:resolution], tags_match=all_strict"):
             both = recall(client, bank_id, tags=[TASK, "kind:resolution"], tags_match="all_strict")
             show(both)
-        wrong = [doc_of(r) for r in both if not doc_of(r).startswith("smoke-res")]
+        wrong = [label_of(r) for r in both if not {TASK, "kind:resolution"} <= set(r.tags or [])]
         record("all_strict narrows to this task's resolutions", bool(both) and not wrong,
                f"wrong docs: {wrong}" if wrong else f"{len(both)} results")
 

@@ -61,12 +61,27 @@ make replay    # replay days 15-30 live; watch the inbox and the Insights page
 
 No API keys yet? The backend runs offline: the agent falls back to a rule-based diagnosis and memory calls are skipped (`MEMORY_ENABLED=false`). Frontend devs can use `VITE_USE_MOCKS=true npm run dev`.
 
+## Hindsight Cloud (what we use)
+
+Local Hindsight runs its own LLM extraction on every retain, which the Groq and Gemini free tiers can't sustain while seeding, so the team uses Hindsight Cloud.
+
+1. In `.env` set `HINDSIGHT_URL=<your Cloud API URL>`, `HINDSIGHT_API_KEY=<your key>`, `HINDSIGHT_BANK_ID=quickbasket-data-platform`, `MEMORY_ENABLED=true`.
+2. Seed the agent's past (days 1–14) from the repo root. The scripts read `.env` too: `python scripts/seed_memory.py`
+3. Run the backend locally (`cd backend` then `uvicorn app.main:app --port 8000`), or in Docker without the local Hindsight: set `HINDSIGHT_URL_DOCKER=<Cloud URL>` and run `docker compose up --build --no-deps backend frontend`.
+4. Check: http://localhost:8000/api/memory/status shows your Cloud URL, and `cd backend` then `python -m app.memory.smoke` passes.
+
+## Results: does memory help?
+
+`cd backend` then `python -m app.agent.eval --markdown` diagnoses failures from the replay window (days 15–30) twice, with and without memory, against a bank seeded with days 1–14, and scores each answer against P3's ground truth. It measures verdict accuracy, whether known failures were recognised, root-cause match, and correct page/don't-page decisions. It is read-only, so runs are repeatable. Raw results go to `data/generated/eval_results.jsonl`.
+
+_Paste the eval's markdown table here after a run on the seeded bank._
+
 ## Groq free tier
 
 `openai/gpt-oss-120b` on the free plan allows 30 requests/min, 8K tokens/min and 200K tokens/day, per organization (not per key). The agent is tuned for this: changes and task history are prefetched so most diagnoses are a single ~2K-token call, gpt-oss runs with `reasoning_effort=low`, and on a 429 it waits for Groq's `Retry-After` (up to 20 s) before falling back to `openai/gpt-oss-20b`.
 
 - Each teammate should use a key from their **own** Groq account while developing; keys from one org share one quota.
-- **Gemini fallback (optional):** set `GEMINI_API_KEY` in `.env` and the agent's chain becomes Groq `gpt-oss-120b` → Gemini (`GEMINI_MODEL`, its own quota) → Groq `gpt-oss-20b`. Check the chain with `curl localhost:8000/api/health`. To give Hindsight the same fallback, copy `docker-compose.override.example.yml` to `docker-compose.override.yml`.
+- **Gemini fallback (optional):** set `GEMINI_API_KEY` in `.env` and the agent's chain becomes Groq `gpt-oss-120b` → Gemini (`GEMINI_MODEL`, its own quota) → Groq `gpt-oss-20b`. Check the chain at http://localhost:8000/api/health (browser, `curl http://localhost:8000/api/health`, or on Windows PowerShell `Invoke-RestMethod http://localhost:8000/api/health`). To give Hindsight the same fallback, copy `docker-compose.override.example.yml` to `docker-compose.override.yml`.
 - For the demo, consider the pay-as-you-go Developer plan (much higher limits, cents of usage).
 - `model_not_found`? A model id was retired: check `LLM_MODEL` / `LLM_FALLBACK_MODEL` in your `.env` against https://console.groq.com/docs/models.
 
@@ -82,6 +97,7 @@ backend/app/
   agent/               doctor.py loop, llm.py (Groq), tools.py            (P1)
   memory/              hindsight_store.py: retain / recall / reflect      (P2)
   prompts/             system prompt                                       (P1)
+backend/app/agent/eval.py  memory ON vs OFF evaluation                   (P1/P4)
 backend/tests/         pytest, runs fully offline                         (P4)
 data/scenarios/        failure scenario YAMLs                              (P3)
 scripts/               generate_history, seed_memory, replay, reset_demo   (P3)
@@ -102,6 +118,7 @@ docs/                  team split, content checklist                       (P7)
 | `GET /api/memory/search?q=` | Recall from the bank |
 | `POST /api/reflect` | Pipeline Health Brief |
 | `GET /api/metrics/learning-curve` | Auto-diagnosed % and accuracy per day |
+| `GET /api/pipelines` | The 6 demo DAGs and their tasks (from `data/dags.yaml`) with incident stats per DAG |
 | `GET /api/metrics/summary` | KPI tiles: totals by verdict, accuracy, pages avoided, MTTR per day, first vs latest day |
 
 Interactive docs: http://localhost:8000/docs
