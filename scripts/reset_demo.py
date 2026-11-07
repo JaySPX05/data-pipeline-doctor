@@ -39,6 +39,8 @@ def delete_bank(base_url: str, bank_id: str, api_key: str | None) -> None:
         print(f"  bank '{bank_id}' deleted")
     except Exception as e:
         print(f"  could not delete bank ({type(e).__name__}: {e}); it may not exist yet, continuing")
+    finally:
+        C.close_quietly(client)
 
 
 def main():
@@ -76,7 +78,11 @@ def main():
 
     print("1/3 Hindsight bank")
     delete_bank(a.base_url, a.bank_id, a.api_key)
-    C.ensure_bank(C.get_hindsight(a.base_url, a.api_key), a.bank_id)
+    admin = C.get_hindsight(a.base_url, a.api_key)
+    try:
+        C.ensure_bank(admin, a.bank_id)
+    finally:
+        C.close_quietly(admin)
 
     print("2/3 SQLite incident store")
     if db and db.exists():

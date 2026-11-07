@@ -43,6 +43,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.deps import get_store  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models.schemas import Incident  # noqa: E402
+from app.memory.hindsight_store import MemoryStore
 
 LOG = """[{date}T03:{m}:02.114+0000] {{taskinstance.py:1937}} INFO - Executing <Task(PythonOperator): load_orders> on scheduled__{date}T03:00:00+00:00
 [{date}T03:{m}:04.870+0000] {{load.py:41}} INFO - Reading s3://qb-landing/freshfarm/orders/{date}/part-0000.parquet from {host}
@@ -185,4 +186,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    finally:
+        MemoryStore.close_all()  # close Hindsight clients: no "Unclosed client session" noise

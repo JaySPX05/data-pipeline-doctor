@@ -245,6 +245,14 @@ def change_memory_item(chg: dict) -> dict:
 
 
 # ------------------------------------------------------------------ hindsight client
+def close_quietly(client) -> None:
+    """Close a Hindsight client, ignoring errors (avoids aiohttp's "Unclosed client session" noise)."""
+    try:
+        client.close()
+    except Exception:
+        pass
+
+
 def get_hindsight(base_url: str | None = None, api_key: str | None = None):
     from hindsight_client import Hindsight        # pip install hindsight-client
     kw = {"base_url": base_url or os.getenv("HINDSIGHT_URL", "http://localhost:8888")}
