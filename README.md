@@ -118,6 +118,7 @@ docs/                  team split, content checklist                       (P7)
 | `GET /api/memory/search?q=` | Recall from the bank |
 | `POST /api/reflect` | Pipeline Health Brief |
 | `GET /api/metrics/learning-curve` | Auto-diagnosed % and accuracy per day |
+| `GET /api/pipelines` | The 6 demo DAGs and their tasks (from `data/dags.yaml`) with incident stats per DAG |
 | `GET /api/metrics/summary` | KPI tiles: totals by verdict, accuracy, pages avoided, MTTR per day, first vs latest day |
 
 Interactive docs: http://localhost:8000/docs
