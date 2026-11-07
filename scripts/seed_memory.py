@@ -7,7 +7,7 @@ metadata and tags (dag:, task:, fp:, kind:). Idempotent: re-running updates the 
 
   python scripts/seed_memory.py --dry-run          # print what would be retained
   python scripts/seed_memory.py                    # seed days 1-14
-  python scripts/seed_memory.py --workers 1     # faster (Hindsight runs LLM extraction per retain)
+    python scripts/seed_memory.py --workers 1        # default; more workers hit an aiohttp timeout error
 """
 from __future__ import annotations
 
